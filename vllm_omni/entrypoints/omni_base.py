@@ -172,6 +172,7 @@ class OmniBase(PDDisaggregationMixin):
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=diffusion_batch_size,
+            log_stats=log_stats,
             **kwargs,
         )
         self._shutdown_called = False

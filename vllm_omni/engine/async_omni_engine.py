@@ -669,7 +669,7 @@ class AsyncOmniEngine:
                                     launch_omni_core_engines(
                                         vllm_config=vllm_config,
                                         executor_class=executor_class,
-                                        log_stats=False,
+                                        log_stats=self.log_stats,
                                         omni_master_server=self._omni_master_server,
                                         stage_id=plan.metadata.stage_id,
                                         stage_config=stage_cfg,
@@ -680,7 +680,7 @@ class AsyncOmniEngine:
                                 addresses, proc, handshake_address = spawn_stage_core(
                                     vllm_config=vllm_config,
                                     executor_class=executor_class,
-                                    log_stats=False,
+                                    log_stats=self.log_stats,
                                 )
                             logger.info(
                                 "[AsyncOmniEngine] Stage %s engine launch started",
@@ -1077,6 +1077,7 @@ class AsyncOmniEngine:
                 stage_pools=self.stage_pools,
                 async_chunk=self.async_chunk,
                 pd_config=pd_config,
+                log_stats=self.log_stats,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

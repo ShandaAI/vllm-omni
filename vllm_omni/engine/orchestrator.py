@@ -15,12 +15,15 @@ from typing import Any
 
 import janus
 import torch
+from vllm import envs
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.metrics.loggers import StatLoggerManager
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -122,6 +125,7 @@ class Orchestrator:
         *,
         async_chunk: bool = False,
         pd_config: dict[str, Any] | None = None,
+        log_stats: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -130,6 +134,27 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self.log_stats = bool(log_stats)
+        self.logger_managers: list[StatLoggerManager | None] = []
+        if self.log_stats:
+            for stage_id, pool in enumerate(stage_pools):
+                vllm_config = pool.stage_vllm_config
+                if vllm_config is None:
+                    self.logger_managers.append(None)
+                    continue
+                logger_manager = StatLoggerManager(
+                    vllm_config=vllm_config,
+                    engine_idxs=[stage_id],
+                    custom_stat_loggers=[],
+                    enable_default_loggers=True,
+                    client_count=pool.num_replicas,
+                    aggregate_engine_logging=False,
+                )
+                logger_manager.log_engine_initialized()
+                self.logger_managers.append(logger_manager)
+        else:
+            self.logger_managers = [None] * self.num_stages
+        self._last_stats_log_time = 0.0
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -446,7 +471,26 @@ class Orchestrator:
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
-                            raw_output = await pool.process_llm_raw_outputs(replica_id, raw_outputs)
+                            iteration_stats = IterationStats() if self.log_stats else None
+                            raw_output = await pool.process_llm_raw_outputs(
+                                replica_id,
+                                raw_outputs,
+                                iteration_stats,
+                            )
+                            logger_manager = self.logger_managers[stage_id]
+                            if logger_manager is not None:
+                                logger_manager.record(
+                                    engine_idx=stage_id,
+                                    scheduler_stats=raw_outputs.scheduler_stats,
+                                    iteration_stats=iteration_stats,
+                                    mm_cache_stats=None,
+                                )
+                                now = _time.monotonic()
+                                if now - self._last_stats_log_time >= envs.VLLM_LOG_STATS_INTERVAL:
+                                    self._last_stats_log_time = now
+                                    for manager in self.logger_managers:
+                                        if manager is not None:
+                                            manager.log()
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:

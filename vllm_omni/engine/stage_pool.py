@@ -272,6 +272,7 @@ class StagePool:
         self,
         replica_id: int,
         raw_outputs: EngineCoreOutputs,
+        iteration_stats: Any = None,
     ) -> list[Any]:
         """Run the shared LLM output processor on one raw poll result."""
         client = self.clients[replica_id]
@@ -279,7 +280,7 @@ class StagePool:
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            None,
+            iteration_stats,
         )
 
         if processed.reqs_to_abort:
