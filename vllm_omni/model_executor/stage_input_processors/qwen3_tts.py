@@ -53,6 +53,10 @@ def talker2code2wav(
         audio_codes = audio_codes[valid_mask]
         if seq_len > 0 and audio_codes.ndim == 2 and int(audio_codes.shape[0]) > seq_len:
             audio_codes = audio_codes[-seq_len:]
+        # Snapshot the pure model-generated codec tokens (before ref_code is
+        # prepended for the decoder) so we can forward them to Code2Wav via
+        # additional_information and echo them back in the final output.
+        model_audio_codes_list = audio_codes.cpu().tolist()  # list[list[int]], shape [T, Q]
         ref_code = mm_codes.get("ref")
         ref_code_len = mm.get("meta", {}).get("ref_code_len")
         if isinstance(ref_code_len, torch.Tensor):
@@ -98,6 +102,9 @@ def talker2code2wav(
         additional_information: dict[str, Any] = {}
         if ref_code_len > 0:
             additional_information["meta"] = {"left_context_size": [ref_code_len]}
+        # Forward the full model-generated codec token sequence so Code2Wav
+        # can echo it into its multimodal_output (see Qwen3TTSCode2Wav).
+        additional_information["full_audio_codes"] = model_audio_codes_list
         # Propagate speaker and language from the original prompt so they are
         # available as runtime_additional_information in later pipeline stages,
         # consistent with qwen3-omni and qwen2.5-omni stage input processors.
@@ -259,6 +266,13 @@ def talker2code2wav_async_chunk(
         "codes": {"audio": code_predictor_codes},
         "meta": {"left_context_size": left_context_size, "finished": torch.tensor(finished, dtype=torch.bool)},
     }
+    # On the final chunk, forward the full model-generated codec token sequence
+    # to the next stage. Code2Wav will echo it back into its multimodal_output
+    # so downstream consumers (e.g. RL training) can read the talker's raw
+    # codec tokens from the same final OmniRequestOutput that carries audio.
+    if finished:
+        full_frames = list(transfer_manager.code_prompt_token_ids[request_id])
+        info["full_audio_codes"] = full_frames  # list[list[int]], shape [T, Q]
     # Propagate speaker and language from the request so they are available
     # as runtime_additional_information in subsequent pipeline stages, consistent
     # with qwen3-omni and qwen2.5-omni stage input processors.

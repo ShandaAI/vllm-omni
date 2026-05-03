@@ -34,6 +34,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
+    AudioWithCodesResponse,
     BatchSpeechRequest,
     BatchSpeechResponse,
     CreateAudio,
@@ -1245,9 +1246,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
-        # Validate language
-        if request.language is not None and request.language not in _TTS_LANGUAGES:
-            return f"Invalid language '{request.language}'. Supported: {', '.join(sorted(_TTS_LANGUAGES))}"
+        # Validate language case-insensitively — downstream model code
+        # lower-cases the tag anyway, so we accept any casing and leave the
+        # request unchanged.
+        if (
+            request.language is not None
+            and request.language.strip().lower() not in {lang.lower() for lang in _TTS_LANGUAGES}
+        ):
+            return (
+                f"Invalid language '{request.language}'. "
+                f"Supported: {', '.join(sorted(_TTS_LANGUAGES))}"
+            )
 
         # Validate speaker for CustomVoice task
         if task_type == "CustomVoice":
@@ -2160,6 +2169,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         base64_encode: bool = False,
         request_id: str | None = None,
     ) -> tuple[bytes | str, str]:
+        audio_data, media_type, _sr, _codec_tokens = await self._generate_audio_and_codes(
+            request, base64_encode=base64_encode, collect_codec_tokens=False,
+            request_id=request_id,
+        )
+        return audio_data, media_type
+
+    async def _generate_audio_and_codes(
+        self,
+        request: OpenAICreateSpeechRequest,
+        base64_encode: bool = False,
+        collect_codec_tokens: bool = False,
+        request_id: str | None = None,
+    ) -> tuple[bytes | str, str, int, list[list[int]] | None]:
+        """Generate audio and (optionally) return the raw codec tokens.
+
+        Returns ``(audio_data, media_type, sample_rate, codec_tokens_or_None)``.
+        """
         request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
 
         # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
@@ -2255,7 +2281,54 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             base64_encode=base64_encode,
         )
         audio_response: AudioResponse = self.create_audio(audio_obj)
-        return audio_response.audio_data, audio_response.media_type
+
+        codec_tokens: list[list[int]] | None = None
+        if collect_codec_tokens:
+            # Qwen3-TTS' Code2Wav stage echoes the talker's codec tokens back
+            # as ``audio_codes`` in the final multimodal_output (see
+            # ``Qwen3TTSCode2Wav.pooler_forward``). Pick up the last non-empty
+            # entry for this request.
+            codec_tokens = self._extract_codec_tokens_from_output(audio_output)
+            if not codec_tokens:
+                logger.warning(
+                    "return_codec_tokens=True but no codec tokens were recorded for request %s. "
+                    "The TTS model may not support codec token extraction.",
+                    request_id,
+                )
+                codec_tokens = []
+
+        return audio_response.audio_data, audio_response.media_type, sample_rate, codec_tokens
+
+    @staticmethod
+    def _extract_codec_tokens_from_output(audio_output: dict) -> list[list[int]] | None:
+        """Extract the talker's codec tokens from the final multimodal_output.
+
+        Code2Wav returns ``audio_codes`` as per-request 2D long tensors of
+        shape ``[T, Q]`` (empty tensor when unavailable). For async_chunk
+        streaming the list may grow across snapshots; walk backwards and
+        return the first non-empty entry as ``list[list[int]]``.
+        """
+        codes_entry = audio_output.get("audio_codes")
+        if codes_entry is None:
+            return None
+
+        if isinstance(codes_entry, torch.Tensor):
+            candidates = [codes_entry]
+        elif isinstance(codes_entry, list):
+            candidates = codes_entry
+        else:
+            return None
+
+        for cand in reversed(candidates):
+            if cand is None:
+                continue
+            if isinstance(cand, torch.Tensor):
+                if cand.numel() == 0:
+                    continue
+                return cand.to(torch.long).cpu().tolist()
+            if isinstance(cand, list) and cand:
+                return cand
+        return None
 
     async def _create_diffusion_speech(
         self,
@@ -2413,6 +2486,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         try:
             if request.stream:
+                if request.return_codec_tokens:
+                    return self.create_error_response(
+                        "return_codec_tokens=True is not supported with stream=True. "
+                        "Use stream=False to retrieve codec tokens alongside audio."
+                    )
                 # Determine response format and media type for streaming
                 response_format = (request.response_format or "wav").lower()
 
@@ -2441,6 +2519,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     ),
                     media_type=media_type,
                 )
+
+            if request.return_codec_tokens:
+                audio_data, media_type, sample_rate, codec_tokens = await self._generate_audio_and_codes(
+                    request, base64_encode=True, collect_codec_tokens=True,
+                    request_id=request_id,
+                )
+                response_obj = AudioWithCodesResponse(
+                    audio_data=audio_data if isinstance(audio_data, str) else audio_data.decode("utf-8"),
+                    media_type=media_type,
+                    codec_tokens=codec_tokens or [],
+                    sample_rate=sample_rate,
+                )
+                return Response(content=response_obj.model_dump_json(), media_type="application/json")
 
             audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
             return Response(content=audio_bytes, media_type=media_type)
