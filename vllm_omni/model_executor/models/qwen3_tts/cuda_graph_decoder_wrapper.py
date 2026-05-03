@@ -15,6 +15,42 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
+def _format_bytes(num_bytes: int) -> str:
+    return f"{num_bytes / (1024**2):.2f} MiB"
+
+
+def _cuda_memory_snapshot(device: torch.device) -> tuple[int, int, int, int]:
+    torch.cuda.synchronize(device)
+    return (
+        torch.cuda.memory_allocated(device),
+        torch.cuda.memory_reserved(device),
+        torch.cuda.max_memory_allocated(device),
+        torch.cuda.max_memory_reserved(device),
+    )
+
+
+def _log_cuda_memory_delta(
+    label: str,
+    start: tuple[int, int, int, int],
+    end: tuple[int, int, int, int],
+) -> None:
+    start_allocated, start_reserved, start_max_allocated, start_max_reserved = start
+    end_allocated, end_reserved, end_max_allocated, end_max_reserved = end
+    logger.info(
+        "%s CUDA memory: allocated=%s (%+s), reserved=%s (%+s), "
+        "max_allocated=%s (%+s), max_reserved=%s (%+s)",
+        label,
+        _format_bytes(end_allocated),
+        _format_bytes(end_allocated - start_allocated),
+        _format_bytes(end_reserved),
+        _format_bytes(end_reserved - start_reserved),
+        _format_bytes(end_max_allocated),
+        _format_bytes(end_max_allocated - start_max_allocated),
+        _format_bytes(end_max_reserved),
+        _format_bytes(end_max_reserved - start_max_reserved),
+    )
+
+
 class CUDAGraphDecoderWrapper:
     """
     CUDA Graph wrapper for Qwen3TTSTokenizerV2Decoder.
@@ -43,9 +79,10 @@ class CUDAGraphDecoderWrapper:
         self.num_quantizers = num_quantizers
         self.enabled = enabled
 
-        self.graphs: dict[int, CUDAGraph] = {}
-        self.static_inputs: dict[int, torch.Tensor] = {}
-        self.static_outputs: dict[int, torch.Tensor] = {}
+        self.graphs: dict[tuple[int, int], CUDAGraph] = {}
+        self.static_inputs: dict[tuple[int, int], torch.Tensor] = {}
+        self.static_outputs: dict[tuple[int, int], torch.Tensor] = {}
+        self.max_batch_size = 1
 
         self._warmed_up = False
         self._device = None
@@ -89,12 +126,14 @@ class CUDAGraphDecoderWrapper:
         dtype: torch.dtype = torch.long,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        max_batch_size: int = 1,
     ):
         if device.type != "cuda" or not self.enabled or self._warmed_up:
             return
 
         self._device = device
         self.decoder.eval()
+        self.max_batch_size = max(1, int(max_batch_size))
 
         if not self._explicit_sizes:
             self.capture_sizes = self.compute_capture_sizes(
@@ -102,28 +141,61 @@ class CUDAGraphDecoderWrapper:
                 codec_left_context_frames=codec_left_context_frames,
             )
 
-        logger.info("Starting CUDA Graph warmup for %d sizes: %s", len(self.capture_sizes), self.capture_sizes)
+        total_graphs = self.max_batch_size * len(self.capture_sizes)
+        logger.info(
+            "Starting CUDA Graph warmup for %d batch sizes x %d seq sizes (%d graphs): batch_sizes=%s seq_lens=%s",
+            self.max_batch_size,
+            len(self.capture_sizes),
+            total_graphs,
+            list(range(1, self.max_batch_size + 1)),
+            self.capture_sizes,
+        )
+        torch.cuda.reset_peak_memory_stats(device)
+        warmup_start_mem = _cuda_memory_snapshot(device)
+        logger.info(
+            "Code2Wav CUDA Graph memory baseline: allocated=%s, reserved=%s",
+            _format_bytes(warmup_start_mem[0]),
+            _format_bytes(warmup_start_mem[1]),
+        )
 
         # Warmup runs to ensure CUDA memory is allocated
-        for size in self.capture_sizes:
-            dummy = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
-            with torch.no_grad():
-                _ = self.decoder(dummy)
+        for batch_size in range(1, self.max_batch_size + 1):
+            for size in self.capture_sizes:
+                dummy = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
+                with torch.no_grad():
+                    _ = self.decoder(dummy)
 
         torch.cuda.synchronize(device)
+        eager_warmup_mem = _cuda_memory_snapshot(device)
+        _log_cuda_memory_delta("Code2Wav eager warmup", warmup_start_mem, eager_warmup_mem)
 
-        for size in self.capture_sizes:
-            try:
-                self._capture(size, device, dtype)
-                logger.info("  Captured CUDA Graph for size=%d", size)
-            except Exception:
-                logger.warning("  Failed to capture graph for size=%d", size, exc_info=True)
+        for batch_size in range(1, self.max_batch_size + 1):
+            for size in self.capture_sizes:
+                try:
+                    before_capture_mem = _cuda_memory_snapshot(device)
+                    self._capture(batch_size, size, device, dtype)
+                    after_capture_mem = _cuda_memory_snapshot(device)
+                    logger.info("  Captured CUDA Graph for batch=%d size=%d", batch_size, size)
+                    _log_cuda_memory_delta(
+                        f"  Capture batch={batch_size} size={size}",
+                        before_capture_mem,
+                        after_capture_mem,
+                    )
+                except Exception:
+                    logger.warning(
+                        "  Failed to capture graph for batch=%d size=%d",
+                        batch_size,
+                        size,
+                        exc_info=True,
+                    )
 
         self._warmed_up = True
-        logger.info("CUDA Graph warmup complete: %d/%d captured", len(self.graphs), len(self.capture_sizes))
+        final_mem = _cuda_memory_snapshot(device)
+        _log_cuda_memory_delta("Code2Wav CUDA Graph total", warmup_start_mem, final_mem)
+        logger.info("CUDA Graph warmup complete: %d/%d captured", len(self.graphs), total_graphs)
 
-    def _capture(self, size: int, device: torch.device, dtype: torch.dtype):
-        static_input = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
+    def _capture(self, batch_size: int, size: int, device: torch.device, dtype: torch.dtype):
+        static_input = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
         with torch.no_grad():
             _ = self.decoder(static_input)
         torch.cuda.synchronize(device)
@@ -133,35 +205,71 @@ class CUDAGraphDecoderWrapper:
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_output = self.decoder(static_input)
 
-        self.graphs[size] = graph
-        self.static_inputs[size] = static_input
-        self.static_outputs[size] = static_output
+        graph_key = (batch_size, size)
+        self.graphs[graph_key] = graph
+        self.static_inputs[graph_key] = static_input
+        self.static_outputs[graph_key] = static_output
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        if not self.enabled or not self._warmed_up or codes.shape[0] != 1:
+        if not self.enabled or not self._warmed_up:
             return self.decoder(codes)
 
         # Inner CUDA graph replay is illegal while an outer stream capture is
         # active (e.g. vLLM's cudagraph_mode=FULL warmup on Stage 1). Fall back
-        # to eager in that case so the outer capture can complete. The guard is
-        # a no-op at runtime: is_current_stream_capturing() returns False
-        # outside the startup capture window, so normal inference still hits
-        # the graph fast path.
+        # to eager in that case so the outer capture can complete.
         if torch.cuda.is_current_stream_capturing():
             return self.decoder(codes)
 
+        batch_size = int(codes.shape[0])
         actual_size = codes.shape[-1]
         padded_size = self._get_padded_size(actual_size)
+        graph_key = (batch_size, padded_size) if padded_size is not None else None
 
-        if padded_size is None or padded_size not in self.graphs:
+        if graph_key is None or graph_key not in self.graphs:
             return self.decoder(codes)
 
-        self.static_inputs[padded_size].zero_()
-        self.static_inputs[padded_size][:, :, :actual_size] = codes
-        self.graphs[padded_size].replay()
+        self.static_inputs[graph_key].zero_()
+        self.static_inputs[graph_key][:, :, :actual_size] = codes
+        self.graphs[graph_key].replay()
 
         actual_out_len = actual_size * self.decoder.total_upsample
-        return self.static_outputs[padded_size][..., :actual_out_len].clone()
+        return self.static_outputs[graph_key][..., :actual_out_len].clone()
+
+    def batched_decode(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
+        if not codes_list:
+            return []
+
+        batch_size = len(codes_list)
+        actual_sizes = [int(codes.shape[-1]) for codes in codes_list]
+        max_actual_size = max(actual_sizes)
+        padded_size = self._get_padded_size(max_actual_size)
+        graph_key = (batch_size, padded_size) if padded_size is not None else None
+
+        if self.enabled and self._warmed_up and graph_key in self.graphs:
+            static_input = self.static_inputs[graph_key]
+            static_input.zero_()
+            for i, codes in enumerate(codes_list):
+                static_input[i : i + 1, :, : actual_sizes[i]] = codes
+            self.graphs[graph_key].replay()
+            output = self.static_outputs[graph_key]
+        else:
+            padded_size = padded_size or max_actual_size
+            padded_input = torch.zeros(
+                batch_size,
+                codes_list[0].shape[1],
+                padded_size,
+                dtype=codes_list[0].dtype,
+                device=codes_list[0].device,
+            )
+            for i, codes in enumerate(codes_list):
+                padded_input[i : i + 1, :, : actual_sizes[i]] = codes
+            output = self.decoder(padded_input)
+
+        total_upsample = self.decoder.total_upsample
+        return [
+            output[i : i + 1, :, : actual_size * total_upsample].clone()
+            for i, actual_size in enumerate(actual_sizes)
+        ]
 
     def chunked_decode_with_cudagraph(
         self,

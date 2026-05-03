@@ -193,22 +193,30 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 pass
 
-        # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # Each request decoded individually with CUDA graph replay at bs=1.
-        wav_tensors: list[torch.Tensor] = []
-        for codes_qf in valid_codes_qf:
-            codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-            try:
-                wav = decoder.chunked_decode(
-                    codes_bqf,
-                    chunk_size=self._decode_chunk_frames,
-                    left_context_size=self._decode_left_context_frames,
-                )  # [1, 1, wav_len]
-            except TypeError:
-                # Unit-test fakes and older decoder shims may not accept the
-                # explicit chunk kwargs; production Qwen3-TTS decoders do.
-                wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
-            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+        # Decode directly on GPU. Multi-request batches are decoded together
+        # so Code2Wav can hit CUDA graphs captured for B > 1.
+        if len(valid_codes_qf) > 1 and hasattr(decoder, "batched_chunked_decode"):
+            wav_tensors = [
+                wav.squeeze(0).squeeze(0)
+                for wav in decoder.batched_chunked_decode(
+                    [codes_qf.unsqueeze(0) for codes_qf in valid_codes_qf]
+                )
+            ]
+        else:
+            wav_tensors = []
+            for codes_qf in valid_codes_qf:
+                codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
+                try:
+                    wav = decoder.chunked_decode(
+                        codes_bqf,
+                        chunk_size=self._decode_chunk_frames,
+                        left_context_size=self._decode_left_context_frames,
+                    )  # [1, 1, wav_len]
+                except TypeError:
+                    # Unit-test fakes and older decoder shims may not accept the
+                    # explicit chunk kwargs; production Qwen3-TTS decoders do.
+                    wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
+                wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req

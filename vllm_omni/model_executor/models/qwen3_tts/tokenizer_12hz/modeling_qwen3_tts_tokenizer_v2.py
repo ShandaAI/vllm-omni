@@ -851,6 +851,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        max_batch_size: int = 1,
     ):
         from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
 
@@ -871,10 +872,12 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             dtype=torch.long,
             codec_chunk_frames=codec_chunk_frames,
             codec_left_context_frames=codec_left_context_frames,
+            max_batch_size=max_batch_size,
         )
         self._cudagraph_enabled = True
         logger.info(
-            "CUDA Graph enabled for decoder: seq_lens=%s",
+            "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s",
+            list(range(1, self._cudagraph_wrapper.max_batch_size + 1)),
             self._cudagraph_wrapper.capture_sizes,
         )
 
@@ -916,6 +919,66 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             wavs.append(wav_chunk[..., context_size * self.total_upsample :])
             start_index = end_index
         return torch.cat(wavs, dim=-1)
+
+    def batched_chunked_decode(self, codes_list, chunk_size=300, left_context_size=25):
+        if not codes_list:
+            return []
+
+        wavs_by_request = [[] for _ in codes_list]
+        start_indices = [0 for _ in codes_list]
+        total_lens = [int(codes.shape[-1]) for codes in codes_list]
+        total_upsample = self.total_upsample
+
+        while True:
+            active_chunks = []
+            active_indices = []
+            context_sizes = []
+
+            for i, codes in enumerate(codes_list):
+                start_index = start_indices[i]
+                total_len = total_lens[i]
+                if start_index >= total_len:
+                    continue
+
+                end_index = min(start_index + chunk_size, total_len)
+                context_size = left_context_size if start_index - left_context_size > 0 else start_index
+                active_chunks.append(codes[..., start_index - context_size : end_index])
+                active_indices.append(i)
+                context_sizes.append(context_size)
+                start_indices[i] = end_index
+
+            if not active_chunks:
+                break
+
+            if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
+                wav_chunks = self._cudagraph_wrapper.batched_decode(active_chunks)
+            else:
+                wav_chunks = self._batched_decode_eager(active_chunks)
+
+            for request_idx, context_size, wav_chunk in zip(active_indices, context_sizes, wav_chunks):
+                wavs_by_request[request_idx].append(wav_chunk[..., context_size * total_upsample :])
+
+        return [torch.cat(wavs, dim=-1) for wavs in wavs_by_request]
+
+    def _batched_decode_eager(self, codes_list):
+        actual_sizes = [int(codes.shape[-1]) for codes in codes_list]
+        max_size = max(actual_sizes)
+        batch_size = len(codes_list)
+        padded_input = torch.zeros(
+            batch_size,
+            codes_list[0].shape[1],
+            max_size,
+            dtype=codes_list[0].dtype,
+            device=codes_list[0].device,
+        )
+        for i, codes in enumerate(codes_list):
+            padded_input[i : i + 1, :, : actual_sizes[i]] = codes
+
+        output = self(padded_input)
+        return [
+            output[i : i + 1, :, : actual_size * self.total_upsample].clone()
+            for i, actual_size in enumerate(actual_sizes)
+        ]
 
 
 class Qwen3TTSTokenizerV2Encoder(MimiModel):
