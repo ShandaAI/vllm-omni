@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from time import time
+from time import monotonic, time
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -77,6 +78,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self._stage_diag_enabled = bool(os.environ.get("BENCH_STAGE0_DIAG"))
+        self._stage_diag_interval_s = float(os.environ.get("BENCH_STAGE0_DIAG_INTERVAL_S", "2.0"))
+        self._stage_diag_last_log = monotonic()
+        self._stage_diag_steps = 0
+        self._stage_diag_total_reqs = 0
+        self._stage_diag_total_tokens = 0
+        self._stage_diag_max_reqs = 0
+        self._stage_diag_max_tokens = 0
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -239,10 +248,44 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Wrap in omni scheduler output to carry transfer metadata.
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
+        self._record_stage0_schedule_diag(scheduler_output)
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+
+    def _record_stage0_schedule_diag(self, scheduler_output: SchedulerOutput) -> None:
+        if not self._stage_diag_enabled:
+            return
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        num_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
+        self._stage_diag_steps += 1
+        self._stage_diag_total_reqs += num_reqs
+        self._stage_diag_total_tokens += num_tokens
+        self._stage_diag_max_reqs = max(self._stage_diag_max_reqs, num_reqs)
+        self._stage_diag_max_tokens = max(self._stage_diag_max_tokens, num_tokens)
+        now = monotonic()
+        if now - self._stage_diag_last_log < self._stage_diag_interval_s:
+            return
+        avg_reqs = self._stage_diag_total_reqs / max(self._stage_diag_steps, 1)
+        avg_tokens = self._stage_diag_total_tokens / max(self._stage_diag_steps, 1)
+        logger.info(
+            "[Stage0 diag] sched_steps=%d avg_sched_reqs=%.2f max_sched_reqs=%d "
+            "avg_sched_tokens=%.2f max_sched_tokens=%d running=%d waiting=%d",
+            self._stage_diag_steps,
+            avg_reqs,
+            self._stage_diag_max_reqs,
+            avg_tokens,
+            self._stage_diag_max_tokens,
+            len(self.running),
+            len(self.waiting),
+        )
+        self._stage_diag_last_log = now
+        self._stage_diag_steps = 0
+        self._stage_diag_total_reqs = 0
+        self._stage_diag_total_tokens = 0
+        self._stage_diag_max_reqs = 0
+        self._stage_diag_max_tokens = 0
 
     def update_from_output(
         self,
@@ -429,7 +472,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
-                        prefill_stats=request.take_prefill_stats(),
+                        prefill_stats=(
+                            request.take_prefill_stats()
+                            if hasattr(request, "take_prefill_stats")
+                            else None
+                        ),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,

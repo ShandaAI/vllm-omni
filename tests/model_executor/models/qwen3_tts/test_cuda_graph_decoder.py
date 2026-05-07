@@ -263,6 +263,23 @@ def test_batch_size_gt1_falls_back(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
+def test_batch_size_pads_to_captured_batch_bucket(decoder):
+    """Actual batch can replay a larger captured batch bucket."""
+    w = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[25],
+        capture_batch_sizes=[4],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    w.warmup(DEVICE)
+    codes = torch.randint(0, 100, (2, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = w.decode(codes)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
 def test_deterministic_across_calls(decoder, wrapper):
     """Same input should produce identical CUDA graph output across calls."""
     codes = _random_codes(30)
@@ -282,17 +299,17 @@ def test_deterministic_across_calls(decoder, wrapper):
     [
         ({}, [2, 4, 8, 16, 32, 64, 128, 256, 325], [512]),
         (
-            {"codec_chunk_frames": 33, "codec_left_context_frames": 25},
-            [2, 4, 8, 16, 32, 33, 58, 64, 128, 256, 325],
-            [512],
+            {"codec_chunk_frames": 33, "codec_left_context_frames": 25, "codec_streaming": True},
+            [2, 4, 8, 16, 32, 33, 58],
+            [64, 128, 256, 325, 512],
         ),
         (
-            {"codec_chunk_frames": 25, "codec_left_context_frames": 25},
-            [2, 4, 8, 16, 25, 32, 50, 64, 128, 256, 325],
-            [512],
+            {"codec_chunk_frames": 25, "codec_left_context_frames": 72, "codec_streaming": True},
+            [2, 4, 8, 16, 25, 32, 64, 97],
+            [128, 256, 325, 512],
         ),
     ],
-    ids=["default", "streaming_c33", "streaming_c25"],
+    ids=["nonstream_default", "streaming_c33", "streaming_qwen3_tts"],
 )
 def test_compute_capture_sizes(kwargs, expected_in, not_expected):
     """compute_capture_sizes produces expected sizes capped by max useful size."""
@@ -301,6 +318,11 @@ def test_compute_capture_sizes(kwargs, expected_in, not_expected):
         assert val in sizes, f"{val} not in {sizes}"
     for val in not_expected:
         assert val not in sizes, f"{val} should not be in {sizes}"
+
+
+def test_compute_capture_batch_sizes_uses_compact_buckets():
+    assert CUDAGraphDecoderWrapper.compute_capture_batch_sizes(4) == [1, 2, 3, 4]
+    assert CUDAGraphDecoderWrapper.compute_capture_batch_sizes(16) == [1, 2, 3, 4, 6, 8, 12, 16]
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -69,6 +69,21 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    temperature: float | None = Field(
+        default=None,
+        ge=0,
+        description="Sampling temperature for autoregressive TTS generation.",
+    )
+    top_p: float | None = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description="Nucleus sampling probability for autoregressive TTS generation.",
+    )
+    top_k: int | None = Field(
+        default=None,
+        description="Top-k sampling cutoff for autoregressive TTS generation. Use -1 to disable.",
+    )
     seed: int | None = Field(
         default=None,
         ge=0,

@@ -851,6 +851,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        codec_streaming: bool = False,
         max_batch_size: int = 1,
     ):
         from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
@@ -872,12 +873,13 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             dtype=torch.long,
             codec_chunk_frames=codec_chunk_frames,
             codec_left_context_frames=codec_left_context_frames,
+            codec_streaming=codec_streaming,
             max_batch_size=max_batch_size,
         )
         self._cudagraph_enabled = True
         logger.info(
             "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s",
-            list(range(1, self._cudagraph_wrapper.max_batch_size + 1)),
+            self._cudagraph_wrapper.capture_batch_sizes,
             self._cudagraph_wrapper.capture_sizes,
         )
 

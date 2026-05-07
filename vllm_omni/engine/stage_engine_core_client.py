@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import multiprocessing.connection
+import os
 import socket
 import threading
 import weakref
@@ -259,13 +260,14 @@ class StageEngineCoreClientBase:
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         """Add request to the stage engine core."""
-        logger.info(
-            "[%s] stage-%s [rep-%s] add request: %s",
-            self.__class__.__name__,
-            self.stage_id,
-            self.replica_id,
-            request.request_id,
-        )
+        if not os.environ.get("VLLM_OMNI_DISABLE_SPEECH_REQUEST_LOG"):
+            logger.info(
+                "[%s] stage-%s [rep-%s] add request: %s",
+                self.__class__.__name__,
+                self.stage_id,
+                self.replica_id,
+                request.request_id,
+            )
         await super().add_request_async(request)
 
     # ==================== Stage Methods ====================

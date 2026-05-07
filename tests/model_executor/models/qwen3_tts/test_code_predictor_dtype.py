@@ -164,6 +164,53 @@ def _make_vllm_config(mocker: MockerFixture, max_num_seqs: int = 4):
     return vllm_config
 
 
+class TestCodePredictorBucketSizing:
+    """Test CodePredictor CUDA graph batch buckets."""
+
+    def test_default_buckets_match_power_of_two_policy(self, loaded_target_classes) -> None:
+        """The default policy should preserve the previous power-of-2 buckets."""
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+
+        assert code_predictor_wrapper.compute_bucket_sizes(128) == [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+        ]
+
+    def test_compact_buckets_include_c96_hotspot(self, loaded_target_classes) -> None:
+        """Opt-in compact buckets should make c96 an exact graph hit."""
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+
+        assert code_predictor_wrapper.compute_bucket_sizes(128, compact=True) == [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            48,
+            64,
+            80,
+            96,
+            112,
+            128,
+        ]
+
+    def test_env_buckets_keep_max_batch(self, loaded_target_classes) -> None:
+        """Custom buckets should be clipped to max and retain max_num_seqs."""
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+
+        assert code_predictor_wrapper.compute_bucket_sizes(
+            128,
+            bucket_sizes_env="1,2,3,96,256",
+        ) == [1, 2, 3, 96, 128]
+
+
 class TestCodePredictorDtypeAlignment:
     """Test that code predictor buffers match model parameter dtype."""
 

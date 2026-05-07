@@ -7,12 +7,31 @@ This module provides CUDA Graph acceleration for the speech tokenizer decoder,
 reducing kernel launch overhead during inference.
 """
 
+import os
+
 import torch
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+def _bench_timing_enabled() -> bool:
+    return bool(os.environ.get("BENCH_CODE2WAV_TIMING"))
+
+
+def _parse_positive_int_list(value: str) -> list[int]:
+    sizes: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        size = int(item)
+        if size <= 0:
+            raise ValueError(f"Expected positive integer, got {size}")
+        sizes.append(size)
+    return sorted(set(sizes))
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -70,12 +89,19 @@ class CUDAGraphDecoderWrapper:
         self,
         decoder: torch.nn.Module,
         capture_sizes: list[int] | None = None,
+        capture_batch_sizes: list[int] | None = None,
         num_quantizers: int = 8,
         enabled: bool = True,
     ):
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
         self.capture_sizes = sorted(capture_sizes) if capture_sizes else []
+        self._explicit_batch_sizes = capture_batch_sizes is not None
+        self.capture_batch_sizes = (
+            sorted({int(size) for size in capture_batch_sizes if int(size) > 0})
+            if capture_batch_sizes
+            else []
+        )
         self.num_quantizers = num_quantizers
         self.enabled = enabled
 
@@ -91,32 +117,63 @@ class CUDAGraphDecoderWrapper:
     def compute_capture_sizes(
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        codec_streaming: bool = False,
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
     ) -> list[int]:
         """Compute capture sizes from chunking config for high graph hit rate."""
         sizes: set[int] = set()
 
-        # Streaming exact hits
+        if codec_streaming and codec_chunk_frames > 0:
+            # Streaming sends one codec window per scheduler step. Capture the
+            # initial chunk, the full left-context window, and compact tail/IC
+            # buckets below the steady-state window.
+            sizes.add(codec_chunk_frames)
+            streaming_max = codec_chunk_frames
+            if codec_left_context_frames > 0:
+                streaming_max = codec_chunk_frames + codec_left_context_frames
+                sizes.add(streaming_max)
+            for p2 in [2, 4, 8, 16, 32, 64, 128, 256]:
+                if p2 < streaming_max:
+                    sizes.add(p2)
+            return sorted(sizes)
+
+        # Preserve the compatible non-streaming sizing behavior.
         if codec_chunk_frames > 0:
             sizes.add(codec_chunk_frames)
             if codec_left_context_frames > 0:
                 sizes.add(codec_chunk_frames + codec_left_context_frames)
 
-        # Non-streaming chunked decode: full chunk + last-chunk buckets
+        if decode_chunk_size > 0:
+            sizes.add(decode_chunk_size)
+
         non_stream_max = decode_chunk_size + decode_left_context
         sizes.add(non_stream_max)
 
-        # Power-of-2 buckets covering both streaming IC sizes and non-streaming last-chunk sizes
         for p2 in [2, 4, 8, 16, 32, 64, 128, 256]:
             if p2 <= non_stream_max:
                 sizes.add(p2)
 
         return sorted(sizes)
 
+    @staticmethod
+    def compute_capture_batch_sizes(max_batch_size: int) -> list[int]:
+        """Compute a compact set of graph batch buckets up to max_batch_size."""
+        max_batch_size = max(1, int(max_batch_size))
+        preferred = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64]
+        sizes = {size for size in preferred if size <= max_batch_size}
+        sizes.add(max_batch_size)
+        return sorted(sizes)
+
     def _get_padded_size(self, actual_size: int) -> int | None:
         for size in self.capture_sizes:
             if actual_size <= size:
+                return size
+        return None
+
+    def _get_padded_batch_size(self, actual_batch_size: int) -> int | None:
+        for size in self.capture_batch_sizes:
+            if actual_batch_size <= size:
                 return size
         return None
 
@@ -126,6 +183,7 @@ class CUDAGraphDecoderWrapper:
         dtype: torch.dtype = torch.long,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        codec_streaming: bool = False,
         max_batch_size: int = 1,
     ):
         if device.type != "cuda" or not self.enabled or self._warmed_up:
@@ -139,15 +197,41 @@ class CUDAGraphDecoderWrapper:
             self.capture_sizes = self.compute_capture_sizes(
                 codec_chunk_frames=codec_chunk_frames,
                 codec_left_context_frames=codec_left_context_frames,
+                codec_streaming=codec_streaming,
             )
+        if not self._explicit_batch_sizes:
+            batch_sizes_env = (
+                (
+                    os.environ.get("CODE2WAV_STREAMING_CUDAGRAPH_BATCH_SIZES")
+                    or os.environ.get("CODE2WAV_CUDAGRAPH_BATCH_SIZES")
+                )
+                if codec_streaming
+                else None
+            )
+            if batch_sizes_env:
+                self.capture_batch_sizes = [
+                    size
+                    for size in _parse_positive_int_list(batch_sizes_env)
+                    if size <= self.max_batch_size
+                ]
+                if self.max_batch_size not in self.capture_batch_sizes:
+                    self.capture_batch_sizes.append(self.max_batch_size)
+                self.capture_batch_sizes = sorted(set(self.capture_batch_sizes))
+            elif codec_streaming:
+                self.capture_batch_sizes = self.compute_capture_batch_sizes(self.max_batch_size)
+            else:
+                self.capture_batch_sizes = list(range(1, self.max_batch_size + 1))
+        if not self.capture_batch_sizes:
+            self.capture_batch_sizes = [1]
+        self.max_batch_size = max(self.capture_batch_sizes)
 
-        total_graphs = self.max_batch_size * len(self.capture_sizes)
+        total_graphs = len(self.capture_batch_sizes) * len(self.capture_sizes)
         logger.info(
-            "Starting CUDA Graph warmup for %d batch sizes x %d seq sizes (%d graphs): batch_sizes=%s seq_lens=%s",
-            self.max_batch_size,
+            "Starting CUDA Graph warmup for %d batch buckets x %d seq sizes (%d graphs): batch_sizes=%s seq_lens=%s",
+            len(self.capture_batch_sizes),
             len(self.capture_sizes),
             total_graphs,
-            list(range(1, self.max_batch_size + 1)),
+            self.capture_batch_sizes,
             self.capture_sizes,
         )
         torch.cuda.reset_peak_memory_stats(device)
@@ -159,7 +243,7 @@ class CUDAGraphDecoderWrapper:
         )
 
         # Warmup runs to ensure CUDA memory is allocated
-        for batch_size in range(1, self.max_batch_size + 1):
+        for batch_size in self.capture_batch_sizes:
             for size in self.capture_sizes:
                 dummy = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
                 with torch.no_grad():
@@ -169,7 +253,7 @@ class CUDAGraphDecoderWrapper:
         eager_warmup_mem = _cuda_memory_snapshot(device)
         _log_cuda_memory_delta("Code2Wav eager warmup", warmup_start_mem, eager_warmup_mem)
 
-        for batch_size in range(1, self.max_batch_size + 1):
+        for batch_size in self.capture_batch_sizes:
             for size in self.capture_sizes:
                 try:
                     before_capture_mem = _cuda_memory_snapshot(device)
@@ -222,18 +306,39 @@ class CUDAGraphDecoderWrapper:
 
         batch_size = int(codes.shape[0])
         actual_size = codes.shape[-1]
+        padded_batch_size = self._get_padded_batch_size(batch_size)
         padded_size = self._get_padded_size(actual_size)
-        graph_key = (batch_size, padded_size) if padded_size is not None else None
+        graph_key = (
+            (padded_batch_size, padded_size)
+            if padded_batch_size is not None and padded_size is not None
+            else None
+        )
 
         if graph_key is None or graph_key not in self.graphs:
+            if _bench_timing_enabled():
+                logger.info(
+                    "[CUDAGraph] op=decode batch=%d padded_batch=%s padded=%s actual=%d hit=false",
+                    batch_size,
+                    padded_batch_size,
+                    padded_size,
+                    actual_size,
+                )
             return self.decoder(codes)
 
+        if _bench_timing_enabled():
+            logger.info(
+                "[CUDAGraph] op=decode batch=%d padded_batch=%d padded=%d actual=%d hit=true",
+                batch_size,
+                padded_batch_size,
+                padded_size,
+                actual_size,
+            )
         self.static_inputs[graph_key].zero_()
-        self.static_inputs[graph_key][:, :, :actual_size] = codes
+        self.static_inputs[graph_key][:batch_size, :, :actual_size] = codes
         self.graphs[graph_key].replay()
 
         actual_out_len = actual_size * self.decoder.total_upsample
-        return self.static_outputs[graph_key][..., :actual_out_len].clone()
+        return self.static_outputs[graph_key][:batch_size, :, :actual_out_len].clone()
 
     def batched_decode(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
         if not codes_list:
@@ -242,10 +347,23 @@ class CUDAGraphDecoderWrapper:
         batch_size = len(codes_list)
         actual_sizes = [int(codes.shape[-1]) for codes in codes_list]
         max_actual_size = max(actual_sizes)
+        padded_batch_size = self._get_padded_batch_size(batch_size)
         padded_size = self._get_padded_size(max_actual_size)
-        graph_key = (batch_size, padded_size) if padded_size is not None else None
+        graph_key = (
+            (padded_batch_size, padded_size)
+            if padded_batch_size is not None and padded_size is not None
+            else None
+        )
 
         if self.enabled and self._warmed_up and graph_key in self.graphs:
+            if _bench_timing_enabled():
+                logger.info(
+                    "[CUDAGraph] op=batched_decode batch=%d padded_batch=%d padded=%d actual=%s hit=true",
+                    batch_size,
+                    padded_batch_size,
+                    padded_size,
+                    ",".join(str(size) for size in actual_sizes),
+                )
             static_input = self.static_inputs[graph_key]
             static_input.zero_()
             for i, codes in enumerate(codes_list):
@@ -253,6 +371,14 @@ class CUDAGraphDecoderWrapper:
             self.graphs[graph_key].replay()
             output = self.static_outputs[graph_key]
         else:
+            if _bench_timing_enabled():
+                logger.info(
+                    "[CUDAGraph] op=batched_decode batch=%d padded_batch=%s padded=%s actual=%s hit=false",
+                    batch_size,
+                    padded_batch_size,
+                    padded_size,
+                    ",".join(str(size) for size in actual_sizes),
+                )
             padded_size = padded_size or max_actual_size
             padded_input = torch.zeros(
                 batch_size,

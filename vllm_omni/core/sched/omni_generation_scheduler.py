@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 
@@ -39,6 +40,74 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        connector_config = getattr(model_config, "stage_connector_config", None) or {}
+        if not isinstance(connector_config, dict):
+            connector_config = {
+                "extra": getattr(connector_config, "extra", {}),
+            }
+        connector_extra = connector_config.get("extra", {}) or {}
+        if not isinstance(connector_extra, dict):
+            connector_extra = {}
+        self._stage1_microbatch_wait_s = (
+            float(
+                os.environ.get(
+                    "CODE2WAV_STAGE1_MICROBATCH_WAIT_MS",
+                    connector_extra.get("stage1_microbatch_wait_ms", 0.0),
+                )
+            )
+            / 1000.0
+        )
+        self._stage1_microbatch_target_batch = max(
+            1,
+            int(
+                os.environ.get(
+                    "CODE2WAV_STAGE1_MICROBATCH_TARGET_BATCH",
+                    connector_extra.get("stage1_microbatch_target_batch", self.max_num_running_reqs),
+                )
+            ),
+        )
+        release_batches_raw = os.environ.get(
+            "CODE2WAV_STAGE1_MICROBATCH_RELEASE_BATCHES",
+            connector_extra.get("stage1_microbatch_release_batches"),
+        )
+        if release_batches_raw is None:
+            self._stage1_microbatch_release_batches = [self._stage1_microbatch_target_batch]
+        else:
+            if isinstance(release_batches_raw, str):
+                release_batch_items = release_batches_raw.split(",")
+            else:
+                release_batch_items = list(release_batches_raw)
+            release_batches = set()
+            for item in release_batch_items:
+                try:
+                    batch_size = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if 1 < batch_size <= self._stage1_microbatch_target_batch:
+                    release_batches.add(batch_size)
+            self._stage1_microbatch_release_batches = sorted(release_batches)
+            if not self._stage1_microbatch_release_batches:
+                self._stage1_microbatch_release_batches = [self._stage1_microbatch_target_batch]
+        self._stage1_microbatch_codec_streaming = bool(connector_extra.get("codec_streaming", False))
+        codec_chunk_frames = int(connector_extra.get("codec_chunk_frames", 25) or 25)
+        codec_left_context_frames = int(connector_extra.get("codec_left_context_frames", 72) or 72)
+        self._stage1_microbatch_t_buckets = sorted(
+            {codec_chunk_frames, codec_chunk_frames + max(codec_left_context_frames, 0)}
+        )
+        self._stage1_microbatch_first_ready_at: dict[str, float] = {}
+        self._stage1_microbatch_last_delayed = 0
+        self._stage1_microbatch_diag_steps_with_delay = 0
+        self._stage1_microbatch_diag_total_delayed = 0
+        self._stage1_microbatch_diag_max_delayed = 0
+        self._stage1_microbatch_diag_max_ready_bucket = 0
+        self._stage_diag_enabled = bool(os.environ.get("BENCH_STAGE1_DIAG") or os.environ.get("BENCH_STAGE0_DIAG"))
+        self._stage_diag_interval_s = float(os.environ.get("BENCH_STAGE_DIAG_INTERVAL_S", "2.0"))
+        self._stage_diag_last_log = time.monotonic()
+        self._stage_diag_steps = 0
+        self._stage_diag_total_reqs = 0
+        self._stage_diag_total_tokens = 0
+        self._stage_diag_max_reqs = 0
+        self._stage_diag_max_tokens = 0
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -70,12 +139,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         req_index = 0
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+        microbatch_delay_req_ids = self._stage1_microbatch_delay_req_ids(scheduled_timestamp)
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
         already_finished_reqs: set[Request] = set()
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if request.request_id in microbatch_delay_req_ids:
+                req_index += 1
+                continue
             # OMNI: Skip requests that are not in self.requests
             if request.request_id not in self.requests or (
                 self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED
@@ -138,6 +211,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             and self._pause_state == PauseState.UNPAUSED
         ):
             request = self.waiting.peek_request()
+            if request.request_id in microbatch_delay_req_ids:
+                self.waiting.pop_request()
+                skipped_waiting_requests.prepend_request(request)
+                continue
             # OMNI: Skip requests that are not in self.requests
             if request.request_id not in self.requests or (
                 self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED
@@ -311,6 +388,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             if self.chunk_transfer_adapter:
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output)
+                self._clear_stage1_microbatch_state(scheduler_output)
 
         except Exception:
             # If anything goes wrong, leave the original output unchanged
@@ -322,7 +400,153 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_transfer_adapter:
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
 
+        self._record_stage1_schedule_diag(scheduler_output)
         return scheduler_output
+
+    def _stage1_request_t_bucket(self, request: Request) -> int | None:
+        chunk_len = len(getattr(request, "prompt_token_ids", []) or [])
+        if not self._stage1_microbatch_codec_streaming:
+            return None
+        additional_info = getattr(request, "additional_information", None)
+        if isinstance(additional_info, dict):
+            codec_streaming = additional_info.get("meta", {}).get("codec_streaming")
+            if codec_streaming is not None and not bool(codec_streaming):
+                return None
+        if chunk_len <= 1:
+            return None
+        for bucket in self._stage1_microbatch_t_buckets:
+            if chunk_len <= bucket:
+                return bucket
+        return self._stage1_microbatch_t_buckets[-1] if self._stage1_microbatch_t_buckets else chunk_len
+
+    def _iter_stage1_ready_requests(self):
+        if self.chunk_transfer_adapter is None:
+            return
+        ready_ids = self.chunk_transfer_adapter.requests_with_ready_chunks
+        seen: set[str] = set()
+        for request in self.running:
+            if request.request_id in ready_ids:
+                seen.add(request.request_id)
+                yield request
+        for request in self.waiting:
+            if request.request_id in seen:
+                continue
+            if request.request_id in ready_ids:
+                yield request
+
+    def _stage1_microbatch_delay_req_ids(self, now: float) -> set[str]:
+        if (
+            self.chunk_transfer_adapter is None
+            or self._stage1_microbatch_wait_s <= 0
+            or self._stage1_microbatch_target_batch <= 1
+        ):
+            self._stage1_microbatch_last_delayed = 0
+            return set()
+
+        buckets: dict[int, list[Request]] = defaultdict(list)
+        live_ready_ids: set[str] = set()
+        for request in self._iter_stage1_ready_requests():
+            bucket = self._stage1_request_t_bucket(request)
+            if bucket is None:
+                continue
+            live_ready_ids.add(request.request_id)
+            self._stage1_microbatch_first_ready_at.setdefault(request.request_id, now)
+            buckets[bucket].append(request)
+
+        stale_ids = set(self._stage1_microbatch_first_ready_at) - live_ready_ids
+        for req_id in stale_ids:
+            self._stage1_microbatch_first_ready_at.pop(req_id, None)
+
+        delayed: set[str] = set()
+        for requests in buckets.values():
+            self._stage1_microbatch_diag_max_ready_bucket = max(
+                self._stage1_microbatch_diag_max_ready_bucket,
+                len(requests),
+            )
+            if any(len(requests) >= batch_size for batch_size in self._stage1_microbatch_release_batches):
+                continue
+            oldest_ready_at = min(
+                self._stage1_microbatch_first_ready_at.get(request.request_id, now)
+                for request in requests
+            )
+            if now - oldest_ready_at >= self._stage1_microbatch_wait_s:
+                continue
+            delayed.update(request.request_id for request in requests)
+        self._stage1_microbatch_last_delayed = len(delayed)
+        if delayed:
+            self._stage1_microbatch_diag_steps_with_delay += 1
+            self._stage1_microbatch_diag_total_delayed += len(delayed)
+            self._stage1_microbatch_diag_max_delayed = max(
+                self._stage1_microbatch_diag_max_delayed,
+                len(delayed),
+            )
+        return delayed
+
+    def _clear_stage1_microbatch_state(self, scheduler_output: SchedulerOutput) -> None:
+        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
+        for req_id in scheduled_req_ids:
+            self._stage1_microbatch_first_ready_at.pop(req_id, None)
+
+    def _record_stage1_schedule_diag(self, scheduler_output: SchedulerOutput) -> None:
+        if not self._stage_diag_enabled:
+            return
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        num_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
+        self._stage_diag_steps += 1
+        self._stage_diag_total_reqs += num_reqs
+        self._stage_diag_total_tokens += num_tokens
+        self._stage_diag_max_reqs = max(self._stage_diag_max_reqs, num_reqs)
+        self._stage_diag_max_tokens = max(self._stage_diag_max_tokens, num_tokens)
+        now = time.monotonic()
+        if now - self._stage_diag_last_log < self._stage_diag_interval_s:
+            return
+        avg_reqs = self._stage_diag_total_reqs / max(self._stage_diag_steps, 1)
+        avg_tokens = self._stage_diag_total_tokens / max(self._stage_diag_steps, 1)
+        waiting_chunks = 0
+        running_chunks = 0
+        ready_chunks = 0
+        finished_chunks = 0
+        if self.chunk_transfer_adapter is not None:
+            waiting_chunks = len(self.chunk_transfer_adapter.waiting_for_chunk_waiting_requests)
+            running_chunks = len(self.chunk_transfer_adapter.waiting_for_chunk_running_requests)
+            ready_chunks = len(self.chunk_transfer_adapter.requests_with_ready_chunks)
+            finished_chunks = len(self.chunk_transfer_adapter.finished_requests)
+        logger.info(
+            "[Stage1 diag] sched_steps=%d avg_sched_reqs=%.2f max_sched_reqs=%d "
+            "avg_sched_tokens=%.2f max_sched_tokens=%d running=%d waiting=%d "
+            "wait_chunk_waiting=%d wait_chunk_running=%d ready_chunks=%d finished_chunks=%d "
+            "micro_wait_ms=%.3f micro_release_batches=%s micro_delayed=%d "
+            "micro_delay_steps=%d micro_total_delayed=%d micro_max_delayed=%d "
+            "micro_max_ready_bucket=%d",
+            self._stage_diag_steps,
+            avg_reqs,
+            self._stage_diag_max_reqs,
+            avg_tokens,
+            self._stage_diag_max_tokens,
+            len(self.running),
+            len(self.waiting),
+            waiting_chunks,
+            running_chunks,
+            ready_chunks,
+            finished_chunks,
+            self._stage1_microbatch_wait_s * 1000.0,
+            self._stage1_microbatch_release_batches,
+            self._stage1_microbatch_last_delayed,
+            self._stage1_microbatch_diag_steps_with_delay,
+            self._stage1_microbatch_diag_total_delayed,
+            self._stage1_microbatch_diag_max_delayed,
+            self._stage1_microbatch_diag_max_ready_bucket,
+        )
+        self._stage_diag_last_log = now
+        self._stage_diag_steps = 0
+        self._stage_diag_total_reqs = 0
+        self._stage_diag_total_tokens = 0
+        self._stage_diag_max_reqs = 0
+        self._stage_diag_max_tokens = 0
+        self._stage1_microbatch_diag_steps_with_delay = 0
+        self._stage1_microbatch_diag_total_delayed = 0
+        self._stage1_microbatch_diag_max_delayed = 0
+        self._stage1_microbatch_diag_max_ready_bucket = 0
 
     def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
         """Handles the finish signal from outside the scheduler.

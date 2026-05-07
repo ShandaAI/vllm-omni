@@ -1,3 +1,5 @@
+import os
+import time
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -45,6 +47,26 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
+        self._stage0_diag_enabled = bool(os.environ.get("BENCH_STAGE0_DIAG"))
+        self._stage0_diag_interval_s = float(os.environ.get("BENCH_STAGE0_DIAG_INTERVAL_S", "2.0"))
+        self._stage0_diag_last_log = time.monotonic()
+        self._stage0_diag_steps = 0
+        self._stage0_diag_total_mtp_batch = 0
+        self._stage0_diag_max_mtp_batch = 0
+        self._stage0_diag_mtp_batch_hist: dict[int, int] = {}
+        model_stage = getattr(self.vllm_config.model_config, "model_stage", "")
+        self._stage0_timing_enabled = (
+            bool(os.environ.get("BENCH_STAGE0_TIMING"))
+            and model_stage == "qwen3_tts"
+        )
+        self._stage0_timing_interval_s = float(
+            os.environ.get(
+                "BENCH_STAGE0_TIMING_INTERVAL_S",
+                os.environ.get("BENCH_STAGE0_DIAG_INTERVAL_S", "2.0"),
+            )
+        )
+        self._stage0_timing_last_log = time.monotonic()
+        self._stage0_timing_stats: dict[str, list[float]] = {}
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
@@ -1182,6 +1204,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ):
         """Align with v0.14.0 preprocess and omni's additional information handling."""
+        preprocess_start = self._stage0_timing_start()
+        section_start = preprocess_start
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -1288,9 +1312,12 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # Note: only prefill need collect additional_information for now.
         # Decode don't need per_req_additional_information anymore.
+        self._record_stage0_timing("preprocess_prepare", section_start)
         if inputs_embeds is not None:
             # Prefill: overlay prompt_embeds and collect additional_information
+            section_start = self._stage0_timing_start()
             self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
+            self._record_stage0_timing("collect_prefill_info", section_start)
 
         # Keep per-request additional_information in sync for both new and
         # cached requests. This is required for stages without preprocess
@@ -1298,11 +1325,14 @@ class OmniGPUModelRunner(GPUModelRunner):
         # from scheduler cached infos on every step.
         if hasattr(self.model, "has_preprocess") or hasattr(self.model, "enable_update_additional_information"):
             if self.vllm_config.model_config.async_chunk:
+                section_start = self._stage0_timing_start()
                 self._update_additional_information(scheduler_output)
+                self._record_stage0_timing("update_additional_info", section_start)
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
+            loop_start = self._stage0_timing_start()
             decode_req_ids = []
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
@@ -1319,9 +1349,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # call the custom process function
                 req_infos["request_id"] = req_id
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
+                req_preprocess_start = self._stage0_timing_start(sync_cuda=False)
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
                 )
+                self._record_stage0_timing("request_preprocess", req_preprocess_start, sync_cuda=False)
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),
@@ -1339,18 +1371,24 @@ class OmniGPUModelRunner(GPUModelRunner):
                     decode_req_ids.append(req_id)
 
                 # TODO(Peiqi): the merge stage could move out from the critical path
+                merge_start = self._stage0_timing_start(sync_cuda=False)
                 self._merge_additional_information_update(req_id, update_dict)
+                self._record_stage0_timing("merge_preprocess_update", merge_start, sync_cuda=False)
 
                 # update the inputs_embeds and input_ids
+                copy_start = self._stage0_timing_start(sync_cuda=False)
                 seg_len = min(span_len, req_embeds.shape[0])
                 inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
                 if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
                     input_ids[s : s + seg_len] = req_input_ids
+                self._record_stage0_timing("apply_preprocess_update", copy_start, sync_cuda=False)
 
+            self._record_stage0_timing("preprocess_loop", loop_start)
             # run talker mtp decode
             if self.has_talker_mtp:
                 self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
+        self._record_stage0_timing("preprocess_total", preprocess_start)
         return (
             input_ids,
             inputs_embeds,
@@ -1361,9 +1399,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
     def _talker_mtp_forward(self, decode_req_ids: list[str], inputs_embeds: torch.Tensor) -> None:
+        total_start = self._stage0_timing_start()
         decode_batch_size = len(decode_req_ids)
+        self._record_stage0_mtp_batch(decode_batch_size)
         if decode_batch_size == 0:
+            self._record_stage0_timing("talker_mtp_total", total_start)
             return
+        prepare_start = self._stage0_timing_start()
         _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
             num_tokens=decode_batch_size,
             num_reqs=decode_batch_size,
@@ -1421,6 +1463,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         }
         if generator is not None:
             talker_kwargs["generator"] = generator
+        self._record_stage0_timing("talker_mtp_prepare", prepare_start)
+        model_start = self._stage0_timing_start()
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
@@ -1431,16 +1475,86 @@ class OmniGPUModelRunner(GPUModelRunner):
                 text_step,
                 **talker_kwargs,
             )
+        self._record_stage0_timing("talker_mtp_model", model_start)
         # update the inputs_embeds and code_predictor_codes
         out_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
         if not isinstance(out_key, tuple) or len(out_key) != 2:
             raise TypeError(f"talker_mtp_output_key must be a 2-tuple, got {type(out_key).__name__}: {out_key!r}")
+        update_start = self._stage0_timing_start(sync_cuda=False)
         for idx, req_id in enumerate(decode_req_ids):
             req_index = self.input_batch.req_ids.index(req_id)
             start_offset = int(self.query_start_loc.cpu[req_index])
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
             update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
             self._merge_additional_information_update(req_id, update_dict)
+        self._record_stage0_timing("talker_mtp_output_update", update_start, sync_cuda=False)
+        self._record_stage0_timing("talker_mtp_total", total_start)
+
+    def _record_stage0_mtp_batch(self, decode_batch_size: int) -> None:
+        if not self._stage0_diag_enabled:
+            return
+        self._stage0_diag_steps += 1
+        self._stage0_diag_total_mtp_batch += decode_batch_size
+        self._stage0_diag_max_mtp_batch = max(self._stage0_diag_max_mtp_batch, decode_batch_size)
+        self._stage0_diag_mtp_batch_hist[decode_batch_size] = (
+            self._stage0_diag_mtp_batch_hist.get(decode_batch_size, 0) + 1
+        )
+        now = time.monotonic()
+        if now - self._stage0_diag_last_log < self._stage0_diag_interval_s:
+            return
+        avg_batch = self._stage0_diag_total_mtp_batch / max(self._stage0_diag_steps, 1)
+        hist = ",".join(
+            f"{batch}:{count}"
+            for batch, count in sorted(self._stage0_diag_mtp_batch_hist.items())
+        )
+        logger.info(
+            "[Stage0 diag] mtp_steps=%d avg_mtp_batch=%.2f max_mtp_batch=%d mtp_batch_hist=%s",
+            self._stage0_diag_steps,
+            avg_batch,
+            self._stage0_diag_max_mtp_batch,
+            hist,
+        )
+        self._stage0_diag_last_log = now
+        self._stage0_diag_steps = 0
+        self._stage0_diag_total_mtp_batch = 0
+        self._stage0_diag_max_mtp_batch = 0
+        self._stage0_diag_mtp_batch_hist.clear()
+
+    def _stage0_timing_start(self, *, sync_cuda: bool = True) -> float:
+        if not self._stage0_timing_enabled:
+            return 0.0
+        if sync_cuda and torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _record_stage0_timing(self, label: str, start: float, *, sync_cuda: bool = True) -> None:
+        if not self._stage0_timing_enabled or start <= 0.0:
+            return
+        if sync_cuda and torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        stats = self._stage0_timing_stats.setdefault(label, [0.0, 0.0, 0.0])
+        stats[0] += 1.0
+        stats[1] += elapsed_ms
+        stats[2] = max(stats[2], elapsed_ms)
+
+    def _maybe_log_stage0_timing(self) -> None:
+        if not self._stage0_timing_enabled:
+            return
+        now = time.monotonic()
+        if now - self._stage0_timing_last_log < self._stage0_timing_interval_s:
+            return
+        if not self._stage0_timing_stats:
+            self._stage0_timing_last_log = now
+            return
+        parts = []
+        for label, (count, total_ms, max_ms) in sorted(self._stage0_timing_stats.items()):
+            if count <= 0:
+                continue
+            parts.append(f"{label}=n{int(count)} avg{total_ms / count:.3f}ms max{max_ms:.3f}ms")
+        logger.info("[Stage0 timing] %s", " ".join(parts))
+        self._stage0_timing_last_log = now
+        self._stage0_timing_stats.clear()
 
     def _model_forward(
         self,
@@ -1453,6 +1567,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         """Inject omni-specific kwargs into forward and cache model output"""
         model_kwargs_extra = self._build_model_kwargs_extra()
 
+        forward_start = self._stage0_timing_start()
         model_output = super()._model_forward(
             input_ids=input_ids,
             positions=positions,
@@ -1461,10 +1576,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs,
             **model_kwargs_extra,
         )
+        self._record_stage0_timing("llm_forward", forward_start)
+        make_output_start = self._stage0_timing_start()
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
+        self._record_stage0_timing("make_omni_output", make_output_start)
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
+        self._maybe_log_stage0_timing()
         return model_output
 
     def _store_value(self, dest: dict, key: str, value: Any, gpu_keys: set) -> None:

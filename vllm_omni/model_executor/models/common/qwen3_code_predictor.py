@@ -14,6 +14,9 @@ Shared by Qwen3-Omni and Qwen3-TTS talker models.
 from __future__ import annotations
 
 import dataclasses
+import os
+import time
+from collections import Counter
 from collections.abc import Iterable
 
 import torch
@@ -27,6 +30,19 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _parse_positive_int_list(value: str) -> list[int]:
+    sizes: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        size = int(item)
+        if size <= 0:
+            raise ValueError(f"Expected positive integer, got {size}")
+        sizes.append(size)
+    return sorted(set(sizes))
 
 
 # ===================================================================
@@ -469,6 +485,28 @@ class CodePredictorWrapper(nn.Module):
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
         self._device_graphs: dict[int, tuple] = {}  # (graph, static_output) per bucket
+        self._diag_enabled = bool(os.environ.get("BENCH_CODE_PREDICTOR_DIAG"))
+        self._diag_interval_s = float(
+            os.environ.get(
+                "BENCH_CODE_PREDICTOR_DIAG_INTERVAL_S",
+                os.environ.get("BENCH_STAGE0_DIAG_INTERVAL_S", "2.0"),
+            )
+        )
+        self._diag_last_log = time.monotonic()
+        self._diag_calls = 0
+        self._diag_rows = 0
+        self._diag_padded_rows = 0
+        self._diag_graph_hits = 0
+        self._diag_bucket_hist: Counter[str] = Counter()
+        self._timing_enabled = bool(os.environ.get("BENCH_CODE_PREDICTOR_TIMING"))
+        self._timing_interval_s = float(
+            os.environ.get(
+                "BENCH_CODE_PREDICTOR_TIMING_INTERVAL_S",
+                os.environ.get("BENCH_STAGE0_DIAG_INTERVAL_S", "2.0"),
+            )
+        )
+        self._timing_last_log = time.monotonic()
+        self._timing_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -538,19 +576,65 @@ class CodePredictorWrapper(nn.Module):
             logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
 
     def _padded_bsz(self, bsz: int) -> int:
-        """Round batch size up to nearest power-of-2 bucket."""
+        """Round batch size up to the nearest captured bucket."""
         for bucket in self._bucket_sizes:
             if bsz <= bucket:
                 return bucket
         return bsz
 
+    @staticmethod
+    def compute_bucket_sizes(
+        max_bsz: int,
+        bucket_sizes_env: str | None = None,
+        compact: bool | None = None,
+    ) -> list[int]:
+        """Compute CodePredictor graph batch buckets."""
+        max_bsz = max(1, int(max_bsz))
+        if bucket_sizes_env is None:
+            bucket_sizes_env = os.environ.get("CODE_PREDICTOR_CUDAGRAPH_BATCH_SIZES")
+        if bucket_sizes_env:
+            sizes = [
+                size
+                for size in _parse_positive_int_list(bucket_sizes_env)
+                if size <= max_bsz
+            ]
+            if max_bsz not in sizes:
+                sizes.append(max_bsz)
+            return sorted(set(sizes))
+
+        if compact is None:
+            compact = bool(os.environ.get("CODE_PREDICTOR_COMPACT_CUDAGRAPH_BATCHES"))
+        if not compact:
+            bucket_sizes = [
+                1 << i
+                for i in range(max_bsz.bit_length())
+                if (1 << i) <= max_bsz
+            ]
+            if max_bsz not in bucket_sizes:
+                bucket_sizes.append(max_bsz)
+            return sorted(bucket_sizes)
+
+        # Optional exploration mode for high-concurrency TTS decode. Actual
+        # batches often land around 80-96, so these buckets avoid padding those
+        # rows to 128. Keep default power-of-2 buckets unless explicitly enabled
+        # because the measured c96 run regressed despite better pad efficiency.
+        preferred = [1, 2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128]
+        sizes = {size for size in preferred if size <= max_bsz}
+        size = 128
+        while size < max_bsz:
+            mid = size + size // 2
+            if mid <= max_bsz:
+                sizes.add(mid)
+            size *= 2
+            if size <= max_bsz:
+                sizes.add(size)
+        sizes.add(max_bsz)
+        return sorted(sizes)
+
     def _warmup_buckets(self) -> None:
-        """Warmup power-of-2 batch-size buckets to front-load Inductor compilation."""
+        """Warmup batch-size buckets to front-load Inductor compilation."""
         max_bsz = self._vllm_config.scheduler_config.max_num_seqs
-        bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
-        if max_bsz not in bucket_sizes:
-            bucket_sizes.append(max_bsz)
-        self._bucket_sizes = sorted(bucket_sizes)
+        self._bucket_sizes = self.compute_bucket_sizes(max_bsz)
 
         max_seq = self._num_groups + 1
         device = next(self.model.parameters()).device
@@ -605,6 +689,87 @@ class CodePredictorWrapper(nn.Module):
 
         logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
 
+    def _record_diag(self, bsz: int, padded_bsz: int, graph_hit: bool) -> None:
+        if not self._diag_enabled:
+            return
+        self._diag_calls += 1
+        self._diag_rows += bsz
+        self._diag_padded_rows += padded_bsz
+        if graph_hit:
+            self._diag_graph_hits += 1
+        self._diag_bucket_hist[f"{bsz}>{padded_bsz}"] += 1
+
+        now = time.monotonic()
+        if now - self._diag_last_log < self._diag_interval_s:
+            return
+        pad_eff = self._diag_rows / max(self._diag_padded_rows, 1)
+        avg_bsz = self._diag_rows / max(self._diag_calls, 1)
+        graph_hit_rate = self._diag_graph_hits / max(self._diag_calls, 1)
+        hist = ",".join(
+            f"{bucket}:{count}"
+            for bucket, count in sorted(
+                self._diag_bucket_hist.items(),
+                key=lambda item: tuple(int(part) for part in item[0].split(">")),
+            )
+        )
+        logger.info(
+            "[CodePredictor diag] calls=%d avg_bsz=%.2f pad_eff=%.3f graph_hit=%.3f buckets=%s",
+            self._diag_calls,
+            avg_bsz,
+            pad_eff,
+            graph_hit_rate,
+            hist,
+        )
+        self._diag_last_log = now
+        self._diag_calls = 0
+        self._diag_rows = 0
+        self._diag_padded_rows = 0
+        self._diag_graph_hits = 0
+        self._diag_bucket_hist.clear()
+
+    def _timing_start(self, device: torch.device) -> torch.cuda.Event | None:
+        if (
+            not self._timing_enabled
+            or device.type != "cuda"
+            or not torch.cuda.is_available()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def _timing_end(self, label: str, start: torch.cuda.Event | None) -> None:
+        if start is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self._timing_events.append((label, start, end))
+
+    def _maybe_log_timing(self) -> None:
+        if not self._timing_enabled or not self._timing_events:
+            return
+        now = time.monotonic()
+        if now - self._timing_last_log < self._timing_interval_s:
+            return
+
+        torch.cuda.synchronize()
+        stats: dict[str, list[float]] = {}
+        for label, start, end in self._timing_events:
+            elapsed_ms = start.elapsed_time(end)
+            label_stats = stats.setdefault(label, [0.0, 0.0, 0.0])
+            label_stats[0] += 1.0
+            label_stats[1] += elapsed_ms
+            label_stats[2] = max(label_stats[2], elapsed_ms)
+        parts = []
+        for label, (count, total_ms, max_ms) in sorted(stats.items()):
+            if count <= 0:
+                continue
+            parts.append(f"{label}=n{int(count)} avg{total_ms / count:.3f}ms max{max_ms:.3f}ms")
+        logger.info("[CodePredictor timing] %s", " ".join(parts))
+        self._timing_last_log = now
+        self._timing_events.clear()
+
     # ------------------------------------------------------------------
     #  Forward -- re-prefill + inline sampling
     # ------------------------------------------------------------------
@@ -641,6 +806,9 @@ class CodePredictorWrapper(nn.Module):
         lm_heads = self._lm_heads_list
         codec_embeds = self._codec_embeds_list
 
+        total_start = self._timing_start(device)
+        prepare_start = self._timing_start(device)
+
         # Zero the padded region of the buffer
         proj_buf[:padded_bsz].zero_()
 
@@ -657,6 +825,9 @@ class CodePredictorWrapper(nn.Module):
 
         # Use captured device graph if available, otherwise call compiled fn.
         device_graph_entry = self._device_graphs.get(padded_bsz)
+        graph_hit = device_graph_entry is not None
+        self._record_diag(bsz, padded_bsz, graph_hit)
+        self._timing_end("prepare", prepare_start)
 
         # Prepare sampling parameters
         stored_mode = self._wrapper_config.sampling_mode == "stored"
@@ -682,15 +853,20 @@ class CodePredictorWrapper(nn.Module):
         # Autoregressive loop: predict layers 1..G-1
         for step in range(1, num_groups):
             # Run transformer (device graph replay or compiled forward)
+            model_start = self._timing_start(device)
             if device_graph_entry is not None:
                 device_graph_entry[0].replay()
                 hidden_out = device_graph_entry[1]
             else:
                 hidden_out = model_fwd(proj_buf[:padded_bsz, :max_seq, :], full_pos_ids)
+            self._timing_end("model", model_start)
 
+            lm_head_start = self._timing_start(device)
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
+            self._timing_end("lm_head", lm_head_start)
 
             # Sample next code
+            sample_start = self._timing_start(device)
             if stored_mode:
                 # "stored" mode: top-k -> top-p -> softmax -> multinomial
                 if s_top_k > 0:
@@ -716,8 +892,10 @@ class CodePredictorWrapper(nn.Module):
                     code = torch.multinomial(probs, num_samples=1, generator=generator)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
+            self._timing_end("sampling", sample_start)
 
             # Store code
+            update_start = self._timing_start(device)
             if self._wrapper_config.return_proj_buf:
                 all_codes[:, step] = code
             else:
@@ -727,7 +905,10 @@ class CodePredictorWrapper(nn.Module):
             if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
                 new_embed = codec_embeds[step - 1](code)
                 proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+            self._timing_end("embed_update", update_start)
 
+        self._timing_end("total", total_start)
+        self._maybe_log_timing()
         if self._wrapper_config.return_proj_buf:
             return all_codes, proj_buf[:bsz].clone()
         return all_codes

@@ -2083,12 +2083,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
             model_type = "generic"
-        logger.info(
-            "TTS speech request %s: text=%r, model=%s",
-            request_id,
-            request.input[:50] + "..." if len(request.input) > 50 else request.input,
-            model_type,
-        )
+        if not os.environ.get("VLLM_OMNI_DISABLE_SPEECH_REQUEST_LOG"):
+            logger.info(
+                "TTS speech request %s: text=%r, model=%s",
+                request_id,
+                request.input[:50] + "..." if len(request.input) > 50 else request.input,
+                model_type,
+            )
 
         # CosyVoice3: set dynamic min/max tokens based on text length.
         # The official model requires min_token_text_ratio to prevent early
@@ -2129,6 +2130,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request.max_new_tokens,
                 )
 
+        if sampling_params_list and (
+            request.temperature is not None
+            or request.top_p is not None
+            or request.top_k is not None
+        ):
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            params = sampling_params_list[0]
+            if request.temperature is not None:
+                params.temperature = request.temperature
+            if request.top_p is not None:
+                params.top_p = request.top_p
+            if request.top_k is not None:
+                params.top_k = request.top_k
+
+        # Propagate per-request seed to sampling params so both Slow AR
+        # and Fast AR produce deterministic output for the same seed.
         if request.seed is not None and sampling_params_list:
             if sampling_params_list is self.engine_client.default_sampling_params_list:
                 import copy

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import time
+from collections import Counter
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -23,6 +27,43 @@ from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class _Code2WavBatchPolicy:
+    min_padding_efficiency: float
+    min_padding_efficiency_b2: float
+    b2_high_load_padding_efficiency: float
+    high_load_ewma_threshold: float
+    replay_overhead_frames: float
+    min_cost_saving: float
+    b2_min_cost_saving: float
+    min_absolute_efficiency: float
+
+
+def _env_float(name: str, default: str, *, mode: str | None = None) -> float:
+    if mode:
+        value = os.environ.get(f"CODE2WAV_{mode}_{name}")
+        if value is not None:
+            return float(value)
+    return float(os.environ.get(f"CODE2WAV_{name}", default))
+
+
+def _make_batch_policy(mode: str | None = None) -> _Code2WavBatchPolicy:
+    return _Code2WavBatchPolicy(
+        min_padding_efficiency=_env_float("BATCH_MIN_PADDING_EFFICIENCY", "0.80", mode=mode),
+        min_padding_efficiency_b2=_env_float("BATCH2_MIN_PADDING_EFFICIENCY", "0.90", mode=mode),
+        b2_high_load_padding_efficiency=_env_float(
+            "BATCH2_HIGH_LOAD_PADDING_EFFICIENCY",
+            "0.80",
+            mode=mode,
+        ),
+        high_load_ewma_threshold=_env_float("BATCH_HIGH_LOAD_EWMA_THRESHOLD", "2.75", mode=mode),
+        replay_overhead_frames=_env_float("BATCH_REPLAY_OVERHEAD_FRAMES", "16", mode=mode),
+        min_cost_saving=_env_float("BATCH_MIN_COST_SAVING", "0.02", mode=mode),
+        b2_min_cost_saving=_env_float("BATCH2_MIN_COST_SAVING", "0.06", mode=mode),
+        min_absolute_efficiency=_env_float("BATCH_MIN_ABSOLUTE_EFFICIENCY", "0.50", mode=mode),
+    )
+
+
 class Qwen3TTSCode2Wav(nn.Module):
     """Stage-1 code2wav model for Qwen3-TTS (GenerationModelRunner).
     Consumes frame-aligned codec tokens from input_ids and decodes waveform
@@ -43,7 +84,10 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         self._decode_chunk_frames = 300
         self._decode_left_context_frames = 25
+        self._codec_streaming = False
         self._logged_codec_stats = False
+        self._streaming_batch_policy = _make_batch_policy("STREAMING")
+        self._observed_batch_size_ewma = 1.0
 
         # Construct decoder from config so it is visible to vLLM's
         # memory profiler at startup.  Weights are loaded later in
@@ -59,6 +103,18 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._output_sample_rate = int(tok_config.output_sample_rate)
         self._total_upsample = int(self.decoder.total_upsample)
         self._decoder_sliding_window = int(getattr(dec_config, "sliding_window", 0) or 0)
+
+    def _batch_policy(self) -> _Code2WavBatchPolicy:
+        return self._streaming_batch_policy
+
+    @staticmethod
+    def _module_device(module: nn.Module) -> torch.device:
+        try:
+            return next(module.parameters()).device
+        except StopIteration:
+            for _, buf in module.named_buffers(recurse=True):
+                return buf.device
+            return torch.device("cpu")
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -91,6 +147,266 @@ class Qwen3TTSCode2Wav(nn.Module):
                 return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
         return [ids]
 
+    @staticmethod
+    def _extract_full_audio_codes(info: dict[str, Any] | None, q: int) -> torch.Tensor:
+        if not info or "full_audio_codes" not in info:
+            return torch.empty((0, q), dtype=torch.long)
+
+        codes = info["full_audio_codes"]
+        if isinstance(codes, torch.Tensor):
+            codes_tensor = codes.to(dtype=torch.long).detach().cpu()
+        else:
+            codes_tensor = torch.tensor(codes, dtype=torch.long)
+
+        if codes_tensor.numel() == 0:
+            return torch.empty((0, q), dtype=torch.long)
+        if codes_tensor.ndim == 1:
+            if codes_tensor.numel() % q != 0:
+                logger.warning(
+                    "Ignoring malformed full_audio_codes with %d elements not divisible by num_quantizers=%d",
+                    codes_tensor.numel(),
+                    q,
+                )
+                return torch.empty((0, q), dtype=torch.long)
+            return codes_tensor.reshape(-1, q).contiguous()
+        if codes_tensor.ndim == 2:
+            return codes_tensor.contiguous()
+
+        logger.warning("Ignoring malformed full_audio_codes shape %s", tuple(codes_tensor.shape))
+        return torch.empty((0, q), dtype=torch.long)
+
+    @staticmethod
+    def _decoder_max_batch_size(decoder: nn.Module) -> int:
+        wrapper = getattr(decoder, "_cudagraph_wrapper", None)
+        if wrapper is None:
+            return 1024
+        return max(1, int(getattr(wrapper, "max_batch_size", 1) or 1))
+
+    @staticmethod
+    def _decoder_padded_size(decoder: nn.Module, actual_size: int) -> int:
+        wrapper = getattr(decoder, "_cudagraph_wrapper", None)
+        get_padded_size = getattr(wrapper, "_get_padded_size", None)
+        if callable(get_padded_size):
+            padded = get_padded_size(actual_size)
+            if padded is not None:
+                return int(padded)
+        return int(actual_size)
+
+    @staticmethod
+    def _decoder_padded_batch_size(decoder: nn.Module, actual_batch_size: int) -> int:
+        wrapper = getattr(decoder, "_cudagraph_wrapper", None)
+        get_padded_batch_size = getattr(wrapper, "_get_padded_batch_size", None)
+        if callable(get_padded_batch_size):
+            padded = get_padded_batch_size(actual_batch_size)
+            if padded is not None:
+                return int(padded)
+        return int(actual_batch_size)
+
+    def _code2wav_work(
+        self,
+        decoder: nn.Module,
+        codes_list: list[torch.Tensor],
+        *,
+        force_serial: bool,
+    ) -> tuple[float, int, int]:
+        policy = self._batch_policy()
+        active_sizes = [int(codes.shape[-1]) for codes in codes_list]
+        actual_work = sum(active_sizes)
+        padded_work = 0
+        cost = 0.0
+        if force_serial:
+            for actual_size in active_sizes:
+                padded_size = self._decoder_padded_size(decoder, actual_size)
+                padded_work += padded_size
+                cost += padded_size + policy.replay_overhead_frames
+        else:
+            padded_size = self._decoder_padded_size(decoder, max(active_sizes))
+            padded_batch_size = self._decoder_padded_batch_size(decoder, len(active_sizes))
+            padded_work = padded_batch_size * padded_size
+            cost = padded_work + policy.replay_overhead_frames
+        return cost, actual_work, padded_work
+
+    def _code2wav_group_efficiency(self, decoder: nn.Module, codes_list: list[torch.Tensor]) -> float:
+        _, actual_work, padded_work = self._code2wav_work(decoder, codes_list, force_serial=False)
+        if padded_work <= 0:
+            return 1.0
+        return actual_work / float(padded_work)
+
+    def _should_batch_codes(self, decoder: nn.Module, codes_list: list[torch.Tensor]) -> bool:
+        batch_size = len(codes_list)
+        if batch_size <= 1:
+            return False
+        policy = self._batch_policy()
+        efficiency = self._code2wav_group_efficiency(decoder, codes_list)
+        threshold = (
+            policy.b2_high_load_padding_efficiency
+            if batch_size == 2 and self._observed_batch_size_ewma >= policy.high_load_ewma_threshold
+            else policy.min_padding_efficiency_b2
+            if batch_size == 2
+            else policy.min_padding_efficiency
+        )
+        if efficiency >= threshold:
+            return True
+        if efficiency < policy.min_absolute_efficiency:
+            return False
+        batch_cost = self._code2wav_work(decoder, codes_list, force_serial=False)[0]
+        serial_cost = self._code2wav_work(decoder, codes_list, force_serial=True)[0]
+        min_saving = policy.b2_min_cost_saving if batch_size == 2 else policy.min_cost_saving
+        return batch_cost <= serial_cost * (1.0 - min_saving)
+
+    def _code2wav_bucket_histogram(
+        self,
+        decoder: nn.Module,
+        codes_list: list[torch.Tensor],
+        *,
+        force_serial: bool,
+    ) -> Counter[str]:
+        hist: Counter[str] = Counter()
+        if force_serial:
+            for codes in codes_list:
+                hist[f"S1x{self._decoder_padded_size(decoder, int(codes.shape[-1]))}"] += 1
+            return hist
+        padded_size = self._decoder_padded_size(decoder, max(int(codes.shape[-1]) for codes in codes_list))
+        padded_batch_size = self._decoder_padded_batch_size(decoder, len(codes_list))
+        hist[f"B{len(codes_list)}>{padded_batch_size}x{padded_size}"] += 1
+        return hist
+
+    def _plan_code2wav_bucket_groups(
+        self,
+        decoder: nn.Module,
+        bucket: list[tuple[int, torch.Tensor]],
+    ) -> list[list[tuple[int, torch.Tensor]]]:
+        if len(bucket) <= 1:
+            return [[item] for item in bucket]
+
+        max_batch_size = self._decoder_max_batch_size(decoder)
+        candidates = range(2, min(max_batch_size, len(bucket)) + 1)
+        ordered = sorted(bucket, key=lambda item: int(item[1].shape[-1]), reverse=True)
+        groups: list[list[tuple[int, torch.Tensor]]] = []
+        offset = 0
+        while offset < len(ordered):
+            best_size = 1
+            best_saving = 0.0
+            for group_size in candidates:
+                if offset + group_size > len(ordered):
+                    break
+                group_codes = [ordered[j][1].unsqueeze(0) for j in range(offset, offset + group_size)]
+                if not self._should_batch_codes(decoder, group_codes):
+                    continue
+                cost = self._code2wav_work(decoder, group_codes, force_serial=False)[0]
+                serial_cost = self._code2wav_work(decoder, group_codes, force_serial=True)[0]
+                saving = serial_cost - cost
+                if saving >= best_saving:
+                    best_size = group_size
+                    best_saving = saving
+            groups.append(ordered[offset : offset + best_size])
+            offset += best_size
+        return groups
+
+    def _decode_single_code2wav(self, decoder: nn.Module, codes_qf: torch.Tensor) -> torch.Tensor:
+        codes_bqf = codes_qf.unsqueeze(0)
+        if self._codec_streaming:
+            wrapper = getattr(decoder, "_cudagraph_wrapper", None)
+            decode = getattr(wrapper, "decode", None)
+            wav = decode(codes_bqf) if callable(decode) else decoder(codes_bqf)
+            return wav.squeeze(0).squeeze(0)
+        try:
+            wav = decoder.chunked_decode(
+                codes_bqf,
+                chunk_size=self._decode_chunk_frames,
+                left_context_size=self._decode_left_context_frames,
+            )
+        except TypeError:
+            wav = decoder.chunked_decode(codes_bqf)
+        return wav.squeeze(0).squeeze(0)
+
+    def _decode_code2wav_batch_once(
+        self,
+        decoder: nn.Module,
+        codes_bqf_list: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        wrapper = getattr(decoder, "_cudagraph_wrapper", None)
+        batched_decode = getattr(wrapper, "batched_decode", None)
+        if callable(batched_decode):
+            return batched_decode(codes_bqf_list)
+        eager_batched_decode = getattr(decoder, "_batched_decode_eager", None)
+        if callable(eager_batched_decode):
+            return eager_batched_decode(codes_bqf_list)
+        return [decoder(codes_bqf) for codes_bqf in codes_bqf_list]
+
+    def _decode_code2wav_grouped(
+        self,
+        decoder: nn.Module,
+        valid_codes_qf: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], dict[str, Any]]:
+        if not self._codec_streaming:
+            raise RuntimeError("Grouped Code2Wav decode is only enabled for streaming codec")
+
+        if len(valid_codes_qf) == 1 or not hasattr(decoder, "batched_chunked_decode"):
+            wav_tensors = [self._decode_single_code2wav(decoder, codes_qf) for codes_qf in valid_codes_qf]
+            bucket_hist = Counter()
+            for codes_qf in valid_codes_qf:
+                bucket_hist.update(
+                    self._code2wav_bucket_histogram(decoder, [codes_qf.unsqueeze(0)], force_serial=True)
+                )
+            return wav_tensors, {
+                "path": "serial",
+                "groups": ["S1"],
+                "avg_group_batch": 1.0,
+                "padding_efficiency": 1.0,
+                "bucket_hist": ",".join(f"{k}:{v}" for k, v in sorted(bucket_hist.items())),
+                "observed_batch_ewma": self._observed_batch_size_ewma,
+            }
+
+        self._observed_batch_size_ewma = 0.95 * self._observed_batch_size_ewma + 0.05 * len(valid_codes_qf)
+        bucketed: dict[int, list[tuple[int, torch.Tensor]]] = {}
+        for index, codes_qf in enumerate(valid_codes_qf):
+            padded_size = self._decoder_padded_size(decoder, int(codes_qf.shape[-1]))
+            bucketed.setdefault(padded_size, []).append((index, codes_qf))
+
+        wav_tensors: list[torch.Tensor | None] = [None] * len(valid_codes_qf)
+        group_labels: list[str] = []
+        group_batch_sizes: list[int] = []
+        weighted_efficiency_num = 0.0
+        weighted_efficiency_den = 0
+        bucket_hist: Counter[str] = Counter()
+        batched_groups = 0
+
+        for padded_size in sorted(bucketed):
+            for group in self._plan_code2wav_bucket_groups(decoder, bucketed[padded_size]):
+                group_indices = [item[0] for item in group]
+                group_codes_qf = [item[1] for item in group]
+                group_codes_bqf = [codes_qf.unsqueeze(0) for codes_qf in group_codes_qf]
+                group_efficiency = self._code2wav_group_efficiency(decoder, group_codes_bqf)
+                weighted_efficiency_num += group_efficiency * len(group_codes_bqf)
+                weighted_efficiency_den += len(group_codes_bqf)
+                if self._should_batch_codes(decoder, group_codes_bqf):
+                    bucket_hist.update(self._code2wav_bucket_histogram(decoder, group_codes_bqf, force_serial=False))
+                    decoded = self._decode_code2wav_batch_once(decoder, group_codes_bqf)
+                    for idx, wav in zip(group_indices, decoded):
+                        wav_tensors[idx] = wav.squeeze(0).squeeze(0)
+                    batched_groups += 1
+                    padded_batch_size = self._decoder_padded_batch_size(decoder, len(group_codes_bqf))
+                    group_labels.append(f"B{len(group_codes_bqf)}>{padded_batch_size}@{padded_size}:{group_efficiency:.2f}")
+                else:
+                    bucket_hist.update(self._code2wav_bucket_histogram(decoder, group_codes_bqf, force_serial=True))
+                    for idx, codes_qf in zip(group_indices, group_codes_qf):
+                        wav_tensors[idx] = self._decode_single_code2wav(decoder, codes_qf)
+                    group_labels.append(f"S{len(group_codes_bqf)}@{padded_size}:{group_efficiency:.2f}")
+                group_batch_sizes.append(len(group_codes_qf))
+
+        if any(wav is None for wav in wav_tensors):
+            raise RuntimeError("Code2Wav grouped decode produced incomplete outputs")
+
+        return [wav for wav in wav_tensors if wav is not None], {
+            "path": "batched" if batched_groups else "serial",
+            "groups": group_labels,
+            "avg_group_batch": sum(group_batch_sizes) / len(group_batch_sizes) if group_batch_sizes else 1.0,
+            "padding_efficiency": weighted_efficiency_num / weighted_efficiency_den if weighted_efficiency_den else 1.0,
+            "bucket_hist": ",".join(f"{k}:{v}" for k, v in sorted(bucket_hist.items())),
+            "observed_batch_ewma": self._observed_batch_size_ewma,
+        }
+
     @torch.no_grad()
     def forward(
         self,
@@ -121,7 +437,11 @@ class Qwen3TTSCode2Wav(nn.Module):
         if input_ids is None or input_ids.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+                multimodal_outputs={
+                    "model_outputs": [empty],
+                    "sr": [sr_tensor],
+                    "audio_codes": [torch.empty((0, q), dtype=torch.long)],
+                },
             )
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
@@ -131,10 +451,12 @@ class Qwen3TTSCode2Wav(nn.Module):
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
+        audio_codes = [torch.empty((0, q), dtype=torch.long) for _ in request_ids_list]
         if runtime_additional_information is not None:
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
                     break
+                audio_codes[i] = self._extract_full_audio_codes(info, q)
                 meta = info.get("meta", {})
                 if "left_context_size" in meta:
                     # left_context_size may come through serialization as an int, [int], or tensor([int]).
@@ -152,6 +474,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             flat = req_ids
             n = flat.numel()
             if n == 0 or n % q != 0:
+                if n == 1 and int(flat.reshape(-1)[0].item()) == 0:
+                    parsed.append((0, 0))
+                    continue
                 if n > 0:
                     logger.warning(
                         "Code2Wav input_ids length %d not divisible by num_quantizers %d; skipping malformed request.",
@@ -174,6 +499,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 multimodal_outputs={
                     "model_outputs": [empty] * num_req,
                     "sr": [sr_tensor] * num_req,
+                    "audio_codes": audio_codes,
                 },
             )
 
@@ -193,9 +519,33 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 pass
 
-        # Decode directly on GPU. Multi-request batches are decoded together
-        # so Code2Wav can hit CUDA graphs captured for B > 1.
-        if len(valid_codes_qf) > 1 and hasattr(decoder, "batched_chunked_decode"):
+        bench_timing = bool(os.environ.get("BENCH_CODE2WAV_TIMING"))
+        timing_start = time.perf_counter() if bench_timing else 0.0
+        if self._codec_streaming:
+            wav_tensors, batch_metrics = self._decode_code2wav_grouped(decoder, valid_codes_qf)
+            if bench_timing:
+                device = self._module_device(decoder)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                decode_ms = (time.perf_counter() - timing_start) * 1000
+                frames = ",".join(str(int(codes_qf.shape[-1])) for codes_qf in valid_codes_qf)
+                total_frames = sum(int(codes_qf.shape[-1]) for codes_qf in valid_codes_qf)
+                logger.info(
+                    "[Code2Wav decode] mode=streaming batch=%d path=%s frames=[%s] decode_ms=%.3f "
+                    "ms_per_frame=%.6f avg_group_batch=%.2f padding_eff=%.3f "
+                    "batch_ewma=%.2f buckets=%s groups=%s",
+                    len(valid_codes_qf),
+                    batch_metrics["path"],
+                    frames,
+                    decode_ms,
+                    decode_ms / max(total_frames, 1),
+                    batch_metrics["avg_group_batch"],
+                    batch_metrics["padding_efficiency"],
+                    batch_metrics["observed_batch_ewma"],
+                    batch_metrics["bucket_hist"],
+                    ";".join(batch_metrics["groups"]),
+                )
+        elif len(valid_codes_qf) > 1 and hasattr(decoder, "batched_chunked_decode"):
             wav_tensors = [
                 wav.squeeze(0).squeeze(0)
                 for wav in decoder.batched_chunked_decode(
@@ -240,7 +590,7 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={"model_outputs": audios, "sr": srs, "audio_codes": audio_codes},
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
@@ -307,9 +657,12 @@ class Qwen3TTSCode2Wav(nn.Module):
         if isinstance(extra_cfg, dict):
             chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
             left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+            self._codec_streaming = bool(extra_cfg.get("codec_streaming", False))
             if getattr(model_cfg, "async_chunk", False) and chunk_frames > 0:
                 self._decode_chunk_frames = chunk_frames
                 self._decode_left_context_frames = left_frames if left_frames > 0 else 0
+        else:
+            self._codec_streaming = False
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
@@ -330,10 +683,14 @@ class Qwen3TTSCode2Wav(nn.Module):
                         self._decoder_sliding_window,
                     )
 
+                scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
+                max_batch_size = int(getattr(scheduler_cfg, "max_num_seqs", 1) or 1)
                 self.decoder.enable_cudagraph(
                     device=device,
                     codec_chunk_frames=chunk_frames,
                     codec_left_context_frames=left_frames,
+                    codec_streaming=self._codec_streaming,
+                    max_batch_size=max_batch_size,
                 )
                 logger.info("Code2Wav decoder CUDA Graph enabled")
             except Exception:
