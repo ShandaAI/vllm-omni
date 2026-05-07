@@ -1,21 +1,20 @@
-# Qwen3-TTS GRPO 训练：vLLM Server 配置方案
+# Qwen3-TTS GRPO 训练：vLLM Server 配置结论
 
 日期：2026-05-07
 
-## 背景
+## 结论
 
-GRPO 训练时 rollout 会产生大量并发的 TTS 推理请求。我们 fork 版 vllm-omni 在 Code2Wav 阶段支持了 streaming CUDA Graph batching，可以把多条请求拼成一个 batch 一起跑，吞吐提升明显。
+GRPO 训练的 vLLM TTS server 应改成 **non-stream deferred** 路径，不做 stage split。
 
-本方案的核心决策：
+原因很简单：之前正式测试里，non-stream 单卡吞吐高于 stream。既然当前目标是 rollout 吞吐，就不应该把 GRPO 默认配置继续放在 stream 上。
 
-- 不做 stage split（不分卡），全部在单卡上完成 AR + Code2Wav
-- 只走 streaming codec 路径，不考虑 non-stream
+## 要改的配置
 
-## 问题：当前配置没吃到 batching 收益
-
-当前 GRPO server 配置（`finetuning/grpo/qwen3_tts_highmem.yaml`）：
+当前默认配置 `/data/zxsu/Qwen3-TTS/finetuning/grpo/qwen3_tts_highmem.yaml` 是 stream 串行 Stage1：
 
 ```yaml
+async_chunk: true
+
 stage_args:
   - stage_id: 1
     engine_args:
@@ -24,65 +23,118 @@ stage_args:
 runtime:
   defaults:
     max_inflight: 1
-```
-
-Code2Wav 阶段同时只处理 1 条请求，完全串行，等于白白浪费了 batching 能力。
-
-## 建议的正式配置
-
-新建配置文件 `finetuning/grpo/qwen3_tts_grpo_stream_b6.yaml`：
-
-```yaml
-async_chunk: true
-
-stage_args:
-  - stage_id: 0
-    engine_args:
-      max_num_seqs: 128
-      max_num_batched_tokens: 512
-      max_model_len: 2048
-      gpu_memory_utilization: 0.8
-
-  - stage_id: 1
-    engine_args:
-      max_num_seqs: 6
-      max_num_batched_tokens: 65536
-      max_model_len: 65536
-      gpu_memory_utilization: 0.15
-
-runtime:
-  defaults:
-    max_inflight: 6
   connectors:
     connector_of_shared_memory:
       extra:
         codec_streaming: true
-        codec_chunk_frames: 25
-        codec_left_context_frames: 72
 ```
 
-关键参数说明：
+这不是吞吐最优配置。
 
-- `max_num_seqs: 6` — Code2Wav 同时最多处理 6 条，已在拆分测试中验证稳定
-- `max_inflight: 6` — 与 max_num_seqs 一致，控制同时在途请求数
-- `codec_streaming: true` — 走流式 codec 路径，支持 CUDA Graph batching
+建议新增正式 GRPO server 配置：
 
-启动时设置环境变量，预编译对应 batch size 的 CUDA Graph：
+```yaml
+# /data/zxsu/Qwen3-TTS/finetuning/grpo/qwen3_tts_grpo_nonstream_b6.yaml
+
+async_chunk: false
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: qwen3_tts
+      max_num_seqs: 128
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      gpu_memory_utilization: 0.65
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 512
+      max_model_len: 2048
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 1024
+      detokenize: false
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: code2wav
+      max_num_seqs: 6
+      model_arch: Qwen3TTSCode2Wav
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.15
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    tts_args:
+      max_instructions_length: 500
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 6
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: false
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+        codec_chunk_frames: 300
+        codec_left_context_frames: 25
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
+```
+
+启动时：
 
 ```bash
-export STAGE_CFG=/data/zxsu/Qwen3-TTS/finetuning/grpo/qwen3_tts_grpo_stream_b6.yaml
-export CODE2WAV_STREAMING_CUDAGRAPH_BATCH_SIZES=1,2,3,4,6
+export STAGE_CFG=/data/zxsu/Qwen3-TTS/finetuning/grpo/qwen3_tts_grpo_nonstream_b6.yaml
 ```
 
-如果显存和稳定性没问题，后续可以尝试 `max_num_seqs=8 / max_inflight=8`，对应：
+## GRPO JSON
 
-```bash
-export CODE2WAV_STREAMING_CUDAGRAPH_BATCH_SIZES=1,2,3,4,6,8
-```
-
-## GRPO 训练参数（暂不需要改）
-
-`finetuning/grpo/config_grpo.json` 中：
+`/data/zxsu/Qwen3-TTS/finetuning/grpo/config_grpo.json` 先保持：
 
 ```json
 "batch_size_per_device": 24,
@@ -90,31 +142,42 @@ export CODE2WAV_STREAMING_CUDAGRAPH_BATCH_SIZES=1,2,3,4,6,8
 "vllm_max_concurrency": 128
 ```
 
-每轮 rollout 产生 24×4=96 条并发请求，正好是 stream batching 收益明显的区间。三路 `vllm_server_url` 继续保留（对应三张卡各跑一个 server），不改成 stage split。
+rollout batch 是 `24 * 4 = 96`，正好是之前正式测试的高并发目标区间。三路 `vllm_server_url` 继续对应三个单卡 server，不做 stage split。
 
-后续可以评估 `max_new_tokens` 是否从 1100 收到 900 左右（训练数据 `max_audio_length=800`），但必须先确认不会截断有效样本。
+## 实测依据
 
-## 性能实测数据
+non-stream 单卡正式矩阵：
 
-streaming c96 拆分测试（xRT = 实时率，越高越好）：
+| concurrency | main xRT | fork xRT | fork / main |
+|---:|---:|---:|---:|
+| 1 | 6.419 | 7.658 | 1.193x |
+| 4 | 11.952 | 25.260 | 2.114x |
+| 8 | 12.337 | 43.329 | 3.512x |
+| 16 | 12.652 | 63.258 | 5.000x |
+| 24 | 14.577 | 76.580 | 5.253x |
+| 32 | 15.923 | 84.447 | 5.304x |
+| 48 | 27.367 | 91.275 | 3.335x |
+| 64 | 41.558 | 94.169 | 2.266x |
+| 96 | 58.820 | 94.106 | 1.600x |
 
-| 测试场景 | 原始 baseline | 原始 stream (seqs=6) | fork stream (seqs=6) | fork 相对提升 |
-|---|---:|---:|---:|---:|
-| deterministic | 45.48 | 52.64 | 67.08 | 1.27× |
-| rollout | 50.84 | 52.84 | 77.95 | 1.48× |
+汇总：
 
-结论：
+- 算术均值 ratio: `3.286x`
+- 几何均值 ratio: `2.909x`
+- c96 单点：`94.106 / 58.820 = 1.600x`
 
-- 上游 stream 支持多并发，但收益有限（+4%~16%）
-- fork 的 CUDA Graph grouped batching 额外带来 27%~48% 的提升
-- 如果 GRPO server 继续用 `max_num_seqs=1`，这部分收益全部浪费
+stream c96 对照：
 
-## 本轮不做的事情
+| suite | main baseline xRT | fork stream xRT | fork / main |
+|---|---:|---:|---:|
+| deterministic | 45.48 | 67.08 | 1.47x |
+| rollout | 50.84 | 77.95 | 1.53x |
 
-| 方案 | 为什么不做 |
-|---|---|
-| non-stream codec | 正式训练只走 stream 路径，non-stream 不作为默认 |
-| stage split（分卡） | 约束明确要求不分卡，保留为诊断参考 |
-| non-stream microbatch hook | stream 路径用不上 |
-| 微等待 batching（等一小段时间凑更大 batch） | 需要单独评估对 latency 和 reward 的影响，暂不引入 |
-| CodePredictor compact/tail buckets | 对 stream 路径不是稳定的主要收益来源 |
+因此按吞吐目标，正式 GRPO server 应优先使用 non-stream deferred 配置。
+
+## 不采用的方向
+
+- stage split：有诊断价值，但当前约束是不分卡。
+- stream 作为默认：吞吐低于已测 non-stream，不应作为正式 GRPO 默认。
+- non-stream microbatch hook：正式 non-stream deferred 配置不依赖它。
+- 微等待 batching：本轮不引入，避免影响 rollout 延迟分布。
