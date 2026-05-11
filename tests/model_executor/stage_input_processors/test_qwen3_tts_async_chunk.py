@@ -367,6 +367,33 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
     ]
 
 
+def test_non_async_processor_forwards_full_audio_codes_only_when_requested():
+    audio_codes = torch.tensor(
+        [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+        ],
+        dtype=torch.long,
+    )
+    output = SimpleNamespace(
+        multimodal_output={"codes": {"audio": audio_codes}},
+        token_ids=list(range(3)),
+        cumulative_token_ids=list(range(3)),
+    )
+    stage = SimpleNamespace(
+        engine_outputs=[SimpleNamespace(outputs=[output], finished=True)],
+    )
+
+    prompts = talker2code2wav(
+        stage.engine_outputs,
+        prompt={"additional_information": {"return_codec_tokens": [True]}},
+    )
+
+    assert len(prompts) == 1
+    assert prompts[0]["additional_information"]["return_codec_tokens"] == [True]
+    assert prompts[0]["additional_information"]["full_audio_codes"] == [[1, 2, 3, 4], [5, 6, 7, 8]]
+
+
 def test_non_async_processor_filters_out_of_range_codec_values():
     """Frames with values >= codebook_size (e.g. stop_token_id=2150) are filtered."""
     ref_code = torch.tensor([[9, 9, 9, 9]], dtype=torch.long)

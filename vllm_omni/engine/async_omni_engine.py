@@ -262,6 +262,7 @@ class AsyncOmniEngine:
             kwargs = {**ea_dict, **kwargs}
 
         self.tokenizer: str | None = kwargs.get("tokenizer")
+        self.log_stats = bool(kwargs.get("log_stats", False))
 
         # ------------------------------------------------------------------ #
         # Single-stage mode detection                                        #

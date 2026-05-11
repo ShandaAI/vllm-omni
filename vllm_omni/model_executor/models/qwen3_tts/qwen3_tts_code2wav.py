@@ -64,6 +64,16 @@ def _make_batch_policy(mode: str | None = None) -> _Code2WavBatchPolicy:
     )
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else False
+    if isinstance(value, torch.Tensor):
+        value = value.reshape(-1)[0].item() if value.numel() > 0 else False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 class Qwen3TTSCode2Wav(nn.Module):
     """Stage-1 code2wav model for Qwen3-TTS (GenerationModelRunner).
     Consumes frame-aligned codec tokens from input_ids and decodes waveform
@@ -115,6 +125,60 @@ class Qwen3TTSCode2Wav(nn.Module):
             for _, buf in module.named_buffers(recurse=True):
                 return buf.device
             return torch.device("cpu")
+
+    def _connector_extra_config(self) -> dict[str, Any]:
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        extra_cfg = (
+            connector_cfg.get("extra", connector_cfg)
+            if isinstance(connector_cfg, dict)
+            else getattr(connector_cfg, "extra", None)
+        )
+        return extra_cfg if isinstance(extra_cfg, dict) else {}
+
+    def _apply_chunk_config(self) -> tuple[int, int]:
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        extra_cfg = self._connector_extra_config()
+        chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
+        left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+        self._codec_streaming = bool(extra_cfg.get("codec_streaming", False))
+        if getattr(model_cfg, "async_chunk", False) and chunk_frames > 0:
+            self._decode_chunk_frames = chunk_frames
+            self._decode_left_context_frames = left_frames if left_frames > 0 else 0
+        return chunk_frames, left_frames
+
+    def _enable_decoder_cudagraph(self, decoder: nn.Module, device: torch.device, chunk_frames: int, left_frames: int):
+        if not hasattr(decoder, "enable_cudagraph") or device.type != "cuda":
+            return
+        try:
+            if (
+                chunk_frames > 0
+                and left_frames > 0
+                and self._decoder_sliding_window
+                and left_frames < self._decoder_sliding_window
+            ):
+                logger.warning(
+                    "Qwen3-TTS streaming codec_left_context_frames=%d "
+                    "is smaller than decoder sliding_window=%d; "
+                    "chunk-boundary distortion may occur. "
+                    "Increase codec_left_context_frames to at least %d for streaming.",
+                    left_frames,
+                    self._decoder_sliding_window,
+                    self._decoder_sliding_window,
+                )
+
+            scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
+            max_batch_size = int(getattr(scheduler_cfg, "max_num_seqs", 1) or 1)
+            decoder.enable_cudagraph(
+                device=device,
+                codec_chunk_frames=chunk_frames,
+                codec_left_context_frames=left_frames,
+                codec_streaming=self._codec_streaming,
+                max_batch_size=max_batch_size,
+            )
+            logger.info("Code2Wav decoder CUDA Graph enabled")
+        except Exception:
+            logger.warning("Failed to enable CUDA Graph for Code2Wav decoder", exc_info=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -174,6 +238,12 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         logger.warning("Ignoring malformed full_audio_codes shape %s", tuple(codes_tensor.shape))
         return torch.empty((0, q), dtype=torch.long)
+
+    @staticmethod
+    def _return_codec_tokens_requested(info: dict[str, Any] | None) -> bool:
+        if not info:
+            return False
+        return _as_bool(info.get("return_codec_tokens", False))
 
     @staticmethod
     def _decoder_max_batch_size(decoder: nn.Module) -> int:
@@ -456,7 +526,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
                     break
-                audio_codes[i] = self._extract_full_audio_codes(info, q)
+                if self._return_codec_tokens_requested(info):
+                    audio_codes[i] = self._extract_full_audio_codes(info, q)
                 meta = info.get("meta", {})
                 if "left_context_size" in meta:
                     # left_context_size may come through serialization as an int, [int], or tensor([int]).
@@ -521,6 +592,7 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         bench_timing = bool(os.environ.get("BENCH_CODE2WAV_TIMING"))
         timing_start = time.perf_counter() if bench_timing else 0.0
+        decode_path = "streaming"
         if self._codec_streaming:
             wav_tensors, batch_metrics = self._decode_code2wav_grouped(decoder, valid_codes_qf)
             if bench_timing:
@@ -546,6 +618,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     ";".join(batch_metrics["groups"]),
                 )
         elif len(valid_codes_qf) > 1 and hasattr(decoder, "batched_chunked_decode"):
+            decode_path = "nonstream_batched"
             wav_tensors = [
                 wav.squeeze(0).squeeze(0)
                 for wav in decoder.batched_chunked_decode(
@@ -553,6 +626,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 )
             ]
         else:
+            decode_path = "nonstream_serial"
             wav_tensors = []
             for codes_qf in valid_codes_qf:
                 codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
@@ -567,6 +641,21 @@ class Qwen3TTSCode2Wav(nn.Module):
                     # explicit chunk kwargs; production Qwen3-TTS decoders do.
                     wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
                 wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+        if bench_timing and not self._codec_streaming:
+            device = self._module_device(decoder)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            decode_ms = (time.perf_counter() - timing_start) * 1000
+            frames = ",".join(str(int(codes_qf.shape[-1])) for codes_qf in valid_codes_qf)
+            total_frames = sum(int(codes_qf.shape[-1]) for codes_qf in valid_codes_qf)
+            logger.info(
+                "[Code2Wav decode] mode=nonstream batch=%d path=%s frames=[%s] decode_ms=%.3f ms_per_frame=%.6f",
+                len(valid_codes_qf),
+                decode_path,
+                frames,
+                decode_ms,
+                decode_ms / max(total_frames, 1),
+            )
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
@@ -644,59 +733,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         if hasattr(self.decoder, "precompute_snake_caches"):
             self.decoder.precompute_snake_caches()
 
-        # Read chunk config from stage connector and update decode params
-        chunk_frames = 0
-        left_frames = 0
-        model_cfg = getattr(self.vllm_config, "model_config", None)
-        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
-        extra_cfg = (
-            connector_cfg.get("extra", connector_cfg)
-            if isinstance(connector_cfg, dict)
-            else getattr(connector_cfg, "extra", None)
-        )
-        if isinstance(extra_cfg, dict):
-            chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
-            left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
-            self._codec_streaming = bool(extra_cfg.get("codec_streaming", False))
-            if getattr(model_cfg, "async_chunk", False) and chunk_frames > 0:
-                self._decode_chunk_frames = chunk_frames
-                self._decode_left_context_frames = left_frames if left_frames > 0 else 0
-        else:
-            self._codec_streaming = False
-
-        if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
-            try:
-                if (
-                    chunk_frames > 0
-                    and left_frames > 0
-                    and self._decoder_sliding_window
-                    and left_frames < self._decoder_sliding_window
-                ):
-                    logger.warning(
-                        "Qwen3-TTS streaming codec_left_context_frames=%d "
-                        "is smaller than decoder sliding_window=%d; "
-                        "chunk-boundary distortion may occur. "
-                        "Increase codec_left_context_frames to at least "
-                        "%d for streaming.",
-                        left_frames,
-                        self._decoder_sliding_window,
-                        self._decoder_sliding_window,
-                    )
-
-                scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
-                max_batch_size = int(getattr(scheduler_cfg, "max_num_seqs", 1) or 1)
-                self.decoder.enable_cudagraph(
-                    device=device,
-                    codec_chunk_frames=chunk_frames,
-                    codec_left_context_frames=left_frames,
-                    codec_streaming=self._codec_streaming,
-                    max_batch_size=max_batch_size,
-                )
-                logger.info("Code2Wav decoder CUDA Graph enabled")
-            except Exception:
-                logger.warning(
-                    "Failed to enable CUDA Graph for Code2Wav decoder",
-                    exc_info=True,
-                )
+        chunk_frames, left_frames = self._apply_chunk_config()
+        self._enable_decoder_cudagraph(self.decoder, device, chunk_frames, left_frames)
 
         return loaded

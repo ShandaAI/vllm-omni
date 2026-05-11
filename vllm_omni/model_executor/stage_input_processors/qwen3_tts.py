@@ -1,5 +1,4 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
-
 from typing import Any
 
 import torch
@@ -17,6 +16,44 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else False
+    if isinstance(value, torch.Tensor):
+        value = value.reshape(-1)[0].item() if value.numel() > 0 else False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _return_codec_tokens_from_prompt(prompt: Any, index: int = 0) -> bool:
+    if prompt is None:
+        return False
+    p = prompt[index] if isinstance(prompt, list) and index < len(prompt) else prompt
+    if p is None or not isinstance(p, dict):
+        return False
+    add_info = p.get("additional_information")
+    if not isinstance(add_info, dict):
+        return False
+    return _as_bool(add_info.get("return_codec_tokens", False))
+
+
+def _return_codec_tokens_from_request(request: Any) -> bool:
+    additional_information = getattr(request, "additional_information", None)
+    if additional_information is None:
+        return False
+    entries = getattr(additional_information, "entries", None)
+    if not isinstance(entries, dict):
+        return False
+    entry = entries.get("return_codec_tokens")
+    if entry is None:
+        return False
+    list_data = getattr(entry, "list_data", None)
+    if isinstance(list_data, list) and list_data:
+        return _as_bool(list_data)
+    return False
 
 
 def talker2code2wav(
@@ -53,10 +90,8 @@ def talker2code2wav(
         audio_codes = audio_codes[valid_mask]
         if seq_len > 0 and audio_codes.ndim == 2 and int(audio_codes.shape[0]) > seq_len:
             audio_codes = audio_codes[-seq_len:]
-        # Snapshot the pure model-generated codec tokens (before ref_code is
-        # prepended for the decoder) so we can forward them to Code2Wav via
-        # additional_information and echo them back in the final output.
-        model_audio_codes_list = audio_codes.cpu().tolist()  # list[list[int]], shape [T, Q]
+        return_codec_tokens = _return_codec_tokens_from_prompt(prompt, index=i)
+        model_audio_codes = audio_codes if return_codec_tokens else None
         ref_code = mm_codes.get("ref")
         ref_code_len = mm.get("meta", {}).get("ref_code_len")
         if isinstance(ref_code_len, torch.Tensor):
@@ -102,9 +137,12 @@ def talker2code2wav(
         additional_information: dict[str, Any] = {}
         if ref_code_len > 0:
             additional_information["meta"] = {"left_context_size": [ref_code_len]}
-        # Forward the full model-generated codec token sequence so Code2Wav
-        # can echo it into its multimodal_output (see Qwen3TTSCode2Wav).
-        additional_information["full_audio_codes"] = model_audio_codes_list
+        if return_codec_tokens and model_audio_codes is not None:
+            # Forward the full model-generated codec token sequence only when
+            # the API caller requested it.  This avoids an extra GPU->CPU copy
+            # on the normal audio-only path.
+            additional_information["return_codec_tokens"] = [True]
+            additional_information["full_audio_codes"] = model_audio_codes.cpu().tolist()
         # Propagate speaker and language from the original prompt so they are
         # available as runtime_additional_information in later pipeline stages,
         # consistent with qwen3-omni and qwen2.5-omni stage input processors.
@@ -270,8 +308,9 @@ def talker2code2wav_async_chunk(
     # to the next stage. Code2Wav will echo it back into its multimodal_output
     # so downstream consumers (e.g. RL training) can read the talker's raw
     # codec tokens from the same final OmniRequestOutput that carries audio.
-    if finished:
+    if finished and _return_codec_tokens_from_request(request):
         full_frames = list(transfer_manager.code_prompt_token_ids[request_id])
+        info["return_codec_tokens"] = [True]
         info["full_audio_codes"] = full_frames  # list[list[int]], shape [T, Q]
     # Propagate speaker and language from the request so they are available
     # as runtime_additional_information in subsequent pipeline stages, consistent

@@ -145,8 +145,8 @@ def test_forward_echoes_full_audio_codes_for_codec_token_return():
     out = model.forward(
         input_ids=torch.arange(12, dtype=torch.long),
         runtime_additional_information=[
-            {"full_audio_codes": [[1, 2], [3, 4]]},
-            {"full_audio_codes": torch.tensor([[5, 6], [7, 8], [9, 10]])},
+            {"return_codec_tokens": [True], "full_audio_codes": [[1, 2], [3, 4]]},
+            {"return_codec_tokens": [True], "full_audio_codes": torch.tensor([[5, 6], [7, 8], [9, 10]])},
         ],
         seq_token_counts=[4, 8],
     )

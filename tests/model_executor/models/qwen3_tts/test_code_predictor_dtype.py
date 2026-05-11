@@ -263,6 +263,43 @@ class TestCodePredictorDtypeAlignment:
 
         assert predictor._proj_buf.dtype == torch.float16
 
+    def test_forward_replays_only_visible_model_sequence(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        """The future projection slot should not be passed to the causal model replay."""
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+        predictor._wrapper_config.use_cuda_graphs = False
+
+        model_forward = mocker.patch.object(
+            predictor.model,
+            "forward",
+            wraps=predictor.model.forward,
+        )
+
+        bsz = 1
+        hidden = talker_config.hidden_size
+        predictor(
+            layer0_code=torch.zeros(bsz, dtype=torch.long),
+            layer0_embed=torch.randn(bsz, hidden),
+            last_talker_hidden=torch.randn(bsz, hidden),
+            do_sample=False,
+        )
+
+        assert model_forward.call_count > 0
+        for call in model_forward.call_args_list:
+            hidden_states = call.args[0]
+            position_ids = call.args[1]
+            assert hidden_states.shape[1] == cp_config.num_code_groups
+            assert position_ids.shape[1] == cp_config.num_code_groups
+
     def test_setup_compile_caches_model_dtype(self, mocker: MockerFixture, loaded_target_classes) -> None:
         """_setup_compile should cache model parameter dtype."""
         _, _, code_predictor_wrapper, _, _ = loaded_target_classes

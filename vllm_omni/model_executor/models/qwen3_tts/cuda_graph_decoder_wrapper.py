@@ -192,30 +192,46 @@ class CUDAGraphDecoderWrapper:
         self._device = device
         self.decoder.eval()
         self.max_batch_size = max(1, int(max_batch_size))
+        decode_chunk_size = 300
 
         if not self._explicit_sizes:
-            self.capture_sizes = self.compute_capture_sizes(
-                codec_chunk_frames=codec_chunk_frames,
-                codec_left_context_frames=codec_left_context_frames,
-                codec_streaming=codec_streaming,
-            )
+            if codec_streaming:
+                sizes_env = os.environ.get("CODE2WAV_STREAMING_CUDAGRAPH_SEQ_SIZES")
+            else:
+                sizes_env = os.environ.get("CODE2WAV_NONSTREAM_CUDAGRAPH_SEQ_SIZES")
+            sizes_env = sizes_env or os.environ.get("CODE2WAV_CUDAGRAPH_SEQ_SIZES")
+            if sizes_env:
+                self.capture_sizes = _parse_positive_int_list(sizes_env)
+            else:
+                self.capture_sizes = self.compute_capture_sizes(
+                    codec_chunk_frames=codec_chunk_frames,
+                    codec_left_context_frames=codec_left_context_frames,
+                    codec_streaming=codec_streaming,
+                )
+                if not codec_streaming and self.max_batch_size > 1:
+                    # The exact full chunk graph is useful for B=1 compatibility
+                    # with upstream, but it multiplies into many large graphs for
+                    # B>1 and has not shown throughput benefit in c96 tuning.
+                    self.capture_sizes = [
+                        size for size in self.capture_sizes if size != decode_chunk_size
+                    ]
         if not self._explicit_batch_sizes:
-            batch_sizes_env = (
-                (
+            if codec_streaming:
+                batch_sizes_env = (
                     os.environ.get("CODE2WAV_STREAMING_CUDAGRAPH_BATCH_SIZES")
                     or os.environ.get("CODE2WAV_CUDAGRAPH_BATCH_SIZES")
                 )
-                if codec_streaming
-                else None
-            )
+            else:
+                batch_sizes_env = (
+                    os.environ.get("CODE2WAV_NONSTREAM_CUDAGRAPH_BATCH_SIZES")
+                    or os.environ.get("CODE2WAV_CUDAGRAPH_BATCH_SIZES")
+                )
             if batch_sizes_env:
                 self.capture_batch_sizes = [
                     size
                     for size in _parse_positive_int_list(batch_sizes_env)
                     if size <= self.max_batch_size
                 ]
-                if self.max_batch_size not in self.capture_batch_sizes:
-                    self.capture_batch_sizes.append(self.max_batch_size)
                 self.capture_batch_sizes = sorted(set(self.capture_batch_sizes))
             elif codec_streaming:
                 self.capture_batch_sizes = self.compute_capture_batch_sizes(self.max_batch_size)

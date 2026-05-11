@@ -2029,6 +2029,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["additional_information"] = tts_params
             else:
                 tts_params = self._build_tts_params(request)
+                if self._tts_model_type == "qwen3_tts":
+                    tts_params["return_codec_tokens"] = [bool(request.return_codec_tokens)]
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
                 # to [[wav_list, sr]] so the model doesn't re-decode base64.
                 ref_audio_source = request.ref_audio

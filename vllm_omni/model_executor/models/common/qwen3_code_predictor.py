@@ -636,7 +636,7 @@ class CodePredictorWrapper(nn.Module):
         max_bsz = self._vllm_config.scheduler_config.max_num_seqs
         self._bucket_sizes = self.compute_bucket_sizes(max_bsz)
 
-        max_seq = self._num_groups + 1
+        model_seq = max(1, self._num_groups)
         device = next(self.model.parameters()).device
 
         # Ensure proj_buf matches model parameter dtype to avoid dtype
@@ -645,10 +645,15 @@ class CodePredictorWrapper(nn.Module):
         proj_buf = self._proj_buf
 
         for bsz in self._bucket_sizes:
-            pos_ids = torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
+            pos_ids = (
+                torch.arange(model_seq, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(bsz, -1)
+                .contiguous()
+            )
             self._bucket_pos_ids[bsz] = pos_ids
             for _ in range(3):
-                self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
+                self._compiled_model_fwd(proj_buf[:bsz, :model_seq, :], pos_ids)
         logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
 
     def _capture_cuda_graphs(self) -> None:
@@ -656,11 +661,11 @@ class CodePredictorWrapper(nn.Module):
         from vllm.platforms import current_platform
 
         pool = current_platform.get_global_graph_pool()
-        max_seq = self._num_groups + 1
+        model_seq = max(1, self._num_groups)
         proj_buf = self._proj_buf
 
         for bsz in self._bucket_sizes:
-            static_input = proj_buf[:bsz, :max_seq, :]
+            static_input = proj_buf[:bsz, :model_seq, :]
             pos_ids = self._bucket_pos_ids[bsz]
 
             g = torch.cuda.CUDAGraph()
@@ -673,12 +678,12 @@ class CodePredictorWrapper(nn.Module):
 
     def _capture_npu_graphs(self) -> None:
         """Capture an NPU graph per bucket using torch_npu's NPUGraph."""
-        max_seq = self._num_groups + 1
+        model_seq = max(1, self._num_groups)
         proj_buf = self._proj_buf
         pool = torch.npu.graph_pool_handle()
 
         for bsz in self._bucket_sizes:
-            static_input = proj_buf[:bsz, :max_seq, :]
+            static_input = proj_buf[:bsz, :model_seq, :]
             pos_ids = self._bucket_pos_ids[bsz]
 
             g = torch.npu.NPUGraph()
@@ -800,7 +805,7 @@ class CodePredictorWrapper(nn.Module):
         self._ensure_buffers(device, dtype, padded_bsz)
 
         proj_buf = self._proj_buf
-        max_seq = num_groups + 1
+        model_seq = max(1, num_groups)
         projection = self.small_to_mtp_projection
         model_fwd = self._compiled_model_fwd
         lm_heads = self._lm_heads_list
@@ -820,7 +825,10 @@ class CodePredictorWrapper(nn.Module):
         full_pos_ids = self._bucket_pos_ids.get(padded_bsz)
         if full_pos_ids is None:
             full_pos_ids = (
-                torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1).contiguous()
+                torch.arange(model_seq, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(padded_bsz, -1)
+                .contiguous()
             )
 
         # Use captured device graph if available, otherwise call compiled fn.
@@ -858,7 +866,7 @@ class CodePredictorWrapper(nn.Module):
                 device_graph_entry[0].replay()
                 hidden_out = device_graph_entry[1]
             else:
-                hidden_out = model_fwd(proj_buf[:padded_bsz, :max_seq, :], full_pos_ids)
+                hidden_out = model_fwd(proj_buf[:padded_bsz, :model_seq, :], full_pos_ids)
             self._timing_end("model", model_start)
 
             lm_head_start = self._timing_start(device)

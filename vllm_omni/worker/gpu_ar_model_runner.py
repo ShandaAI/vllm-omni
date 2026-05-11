@@ -665,33 +665,37 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         logits: torch.Tensor | None,
         spec_decode_metadata: Any,
     ):
+        sample_start = self._stage0_timing_start()
         sampling_metadata = self.input_batch.sampling_metadata
-        if spec_decode_metadata is None:
-            model_sample = getattr(self.model, "sample", None)
-            if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
-                # Apply logit bias (min_tokens, allowed_token_ids) before
-                # the custom model sampler — the standard GPU sampler does
-                # this internally, but prefer_model_sampler bypasses it.
-                if hasattr(self.sampler, "logit_bias_state"):
-                    self.sampler.logit_bias_state.apply_logit_bias(
+        try:
+            if spec_decode_metadata is None:
+                model_sample = getattr(self.model, "sample", None)
+                if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
+                    # Apply logit bias (min_tokens, allowed_token_ids) before
+                    # the custom model sampler — the standard GPU sampler does
+                    # this internally, but prefer_model_sampler bypasses it.
+                    if hasattr(self.sampler, "logit_bias_state"):
+                        self.sampler.logit_bias_state.apply_logit_bias(
+                            logits,
+                            self.input_batch.expanded_idx_mapping,
+                            self.input_batch.idx_mapping_np,
+                            self.input_batch.positions[self.input_batch.logits_indices],
+                        )
+                    sampler_output = model_sample(
                         logits,
-                        self.input_batch.expanded_idx_mapping,
-                        self.input_batch.idx_mapping_np,
-                        self.input_batch.positions[self.input_batch.logits_indices],
+                        self._sampling_metadata_for_model_sampler(sampling_metadata),
                     )
-                sampler_output = model_sample(
-                    logits,
-                    self._sampling_metadata_for_model_sampler(sampling_metadata),
+                    if sampler_output is not None:
+                        return sampler_output
+                self.input_batch.update_async_output_token_ids()
+                return self.sampler(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
                 )
-                if sampler_output is not None:
-                    return sampler_output
-            self.input_batch.update_async_output_token_ids()
-            return self.sampler(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
 
-        return super()._sample(logits, spec_decode_metadata)
+            return super()._sample(logits, spec_decode_metadata)
+        finally:
+            self._record_stage0_timing("sample", sample_start)
 
     @staticmethod
     def _resolve_req_hidden_states(

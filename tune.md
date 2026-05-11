@@ -175,6 +175,85 @@ stream c96 对照：
 
 因此按吞吐目标，正式 GRPO server 应优先使用 non-stream deferred 配置。
 
+## Streaming + Code2Wav multi-batch CUDA Graph
+
+Streaming 模式（`async_chunk=true`、`codec_streaming=true`）下，Code2Wav 支持同时处理多条请求并使用 CUDA Graph。单卡 H200，deterministic。
+
+三组：`main-baseline`（upstream，Stage1 单请求）、`fork-compatible`（fork，Stage1 单请求）、`fork-code2wav-batch`（fork，Stage1 最多 4 请求）。
+
+### 吞吐（3 repeats）
+
+fork 两组 c1 受 `--log-stats` 统计采集开销影响，数据不可用，已标注。
+
+| 并发 | main xRT | fork-compat xRT | fork-batch xRT | batch vs main |
+|---:|---:|---:|---:|---:|
+| c1 | 6.70 | 4.89 ⚠️ | 4.89 ⚠️ | -27% ⚠️ |
+| c4 | 17.99 | 17.72 | 18.03 | +0.2% |
+| c8 | 26.48 | 25.06 | 26.33 | -0.6% |
+| c16 | 33.71 | 32.71 | 36.47 | +8.2% |
+| c24 | 36.12 | 35.81 | 42.75 | +18.4% |
+| c32 | 38.61 | 38.02 | 49.15 | +27.3% |
+| c48 | 43.37 | 42.71 | 55.96 | +29.0% |
+| c64 | 44.13 | 48.12 | 57.41 | +30.1% |
+| c96 | 49.32 | 崩溃 | — | — |
+
+数据：`outputs/vllm_tts_ab_benchmark/runs_perf_*`。
+
+修复统计采集 + batch 策略优化后（1 repeat，带 timing）：
+
+| 并发 | fork-compat xRT | fork-batch xRT | batch vs compat |
+|---:|---:|---:|---:|
+| c1 | 5.30 | 6.32 | +19.1%（timing 开销） |
+| c8 | 21.77 | 26.94 | +23.7% |
+| c16 | 32.41 | 33.17 | +2.3% |
+| c32 | 39.61 | 48.70 | +22.9% |
+| c64 | 43.59 | 56.55 | +29.8% |
+
+数据：`outputs/vllm_tts_ab_benchmark/runs_batch_policy3_*`。
+
+### 延迟（3 repeats）
+
+| 并发 | main p50/p95 | batch p50/p95 | p50 改善 | p95 改善 |
+|---:|---:|---:|---:|---:|
+| c16 | 6247/7546ms | 5373/7170ms | -14% | -5% |
+| c32 | 11820/14424ms | 8420/10966ms | -29% | -24% |
+| c48 | 14844/18357ms | 11095/14721ms | -25% | -20% |
+| c64 | 16962/24133ms | 13648/17099ms | -20% | -29% |
+
+### 单请求开销
+
+同 GPU、不开 timing、依次跑两组 c1：
+
+| 组 | xRT | p50 | p95 |
+|---|---:|---:|---:|
+| fork-compatible | 6.72 | 2214ms | 2959ms |
+| fork-code2wav-batch | 6.62 | 2256ms | 2998ms |
+
+差距 -1.5%，单请求几乎没有额外开销。数据：`outputs/vllm_tts_ab_benchmark/runs_batch_policy3_c1_pair_notiming`。
+
+### Code2Wav 诊断
+
+| 并发 | 平均 batch | CUDA Graph 命中 | padding 利用率 | ms/frame |
+|---:|---:|---:|---:|---:|
+| c1 | 1.00 | 100% | 89.8% | 0.918 |
+| c8 | 1.74 | 100% | 87.6% | 0.717 |
+| c16 | 2.28 | 100% | 86.4% | 0.617 |
+| c32 | 2.65 | 100% | 85.6% | 0.551 |
+| c64 | 3.47 | 100% | 85.8% | 0.359 |
+
+c1 全部逐条 decode，c64 多数走 batch decode，每帧耗时从 0.92ms 降到 0.36ms。
+
+### batch 策略
+
+只有一条请求时直接走 `decoder.chunked_decode()`，不做任何额外计算。两条及以上时，先看整批 padding 利用率（实际 token 数 / padding 后 token 数）是否达标；达标就整批 decode，否则按 padding 后长度分组，每组单独判断。batch=2 在低负载时要求利用率更高（0.90），高负载时放宽到 0.80，由近期实际 batch 深度的滑动均值决定。阈值可通过环境变量调整（`CODE2WAV_BATCH_MIN_PADDING_EFFICIENCY` 等）。
+
+### 结论
+
+- c32+ 吞吐 +23~30%，p50 延迟 -20~29%。
+- 单请求无额外开销（-1.5%）。
+- CUDA Graph 100% 命中，padding 利用率 85-90%。
+- non-stream B1-deferred c96 单卡到 ~62-84 xRT，streaming batch c64 到 ~56.55 xRT。前者减少 Stage1 调度次数，后者减少 Code2Wav 串行时间，解决的是不同问题。
+
 ## 不采用的方向
 
 - stage split：有诊断价值，但当前约束是不分卡。
